@@ -72,7 +72,7 @@ fn main() -> Result<(), String> {
     );
 
     // --- 创建渲染器 ---
-    let renderer = Renderer::new(args.width, args.height);
+    let renderer = Renderer::new(args.width, args.height, args.msaa_level);
 
     // --- 渲染动画或单帧 ---
     if args.animate {

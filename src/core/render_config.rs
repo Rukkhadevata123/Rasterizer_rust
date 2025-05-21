@@ -30,6 +30,10 @@ pub struct RenderConfig {
     /// 是否应用gamma校正（sRGB空间转换）
     pub apply_gamma_correction: bool,
 
+    // 抗锯齿设置
+    /// 抗锯齿级别: 0=禁用，1=2xMSAA，2=4xMSAA，3=8xMSAA
+    pub msaa_level: u8,
+
     // 光照信息
     /// 默认光源配置
     pub light: Light,
@@ -59,7 +63,7 @@ pub struct RenderConfig {
     pub enable_gradient_background: bool,
     /// 渐变背景顶部颜色
     pub gradient_top_color: Vector3<f32>,
-    /// 渐变背景底部颜色
+    /// 渊变背景底部颜色
     pub gradient_bottom_color: Vector3<f32>,
 
     /// 启用地面平面
@@ -81,6 +85,7 @@ impl Default for RenderConfig {
             use_pbr: false,
             use_texture: true,
             apply_gamma_correction: true,
+            msaa_level: 0,
             light: Light::directional(
                 nalgebra::Vector3::new(0.0, -1.0, -1.0).normalize(),
                 nalgebra::Vector3::new(1.0, 1.0, 1.0),
@@ -111,6 +116,36 @@ impl RenderConfig {
             "Phong着色模型".to_string()
         } else {
             "平面着色模型".to_string()
+        }
+    }
+
+    /// 获取MSAA采样点位置
+    pub fn msaa_sample_positions(&self) -> Vec<(f32, f32)> {
+        match self.msaa_level {
+            1 => vec![
+                // 改进的2x MSAA（旋转网格模式）
+                (0.25, 0.75), // 左上
+                (0.75, 0.25), // 右下
+            ],
+            2 => vec![
+                // 改进的4x MSAA（旋转网格）
+                (0.375, 0.125), // 右上
+                (0.875, 0.375), // 右下
+                (0.125, 0.625), // 左上
+                (0.625, 0.875), // 左下
+            ],
+            3 => vec![
+                // 8x MSAA（标准旋转网格模式）
+                (0.0625, 0.3125), // 更靠近边缘
+                (0.3125, 0.0625),
+                (0.6875, 0.1875),
+                (0.9375, 0.4375),
+                (0.1875, 0.6875),
+                (0.4375, 0.9375),
+                (0.8125, 0.5625),
+                (0.5625, 0.8125),
+            ],
+            _ => vec![(0.5, 0.5)], // 无MSAA（中心采样）
         }
     }
 
@@ -147,6 +182,11 @@ impl RenderConfig {
 
     pub fn with_texture(mut self, use_texture: bool) -> Self {
         self.use_texture = use_texture;
+        self
+    }
+
+    pub fn with_msaa(mut self, level: u8) -> Self {
+        self.msaa_level = level.min(3); // 限制最大级别为3（8x MSAA）
         self
     }
 
@@ -262,6 +302,8 @@ pub fn create_render_config(scene: &Scene, args: &Args) -> RenderConfig {
         // --- 投影和缓冲设置 ---
         .with_projection(&args.projection)
         .with_zbuffer(args.use_zbuffer)
+        // --- 抗锯齿设置 ---
+        .with_msaa(args.msaa_level)
         // --- 材质和着色设置 ---
         .with_face_colors(args.colorize)
         .with_texture(args.use_texture)
@@ -308,6 +350,16 @@ pub fn print_render_config_summary(config: &RenderConfig, args: &Args) {
     } else {
         println!("着色模型: 平面着色模型");
     }
+
+    // --- 抗锯齿设置 ---
+    let msaa_desc = match args.msaa_level {
+        0 => "禁用".to_string(),
+        1 => "2x MSAA".to_string(),
+        2 => "4x MSAA".to_string(),
+        3 => "8x MSAA".to_string(),
+        _ => format!("未知 ({})", args.msaa_level),
+    };
+    println!("抗锯齿: {}", msaa_desc);
 
     // --- 光照设置 ---
     println!(

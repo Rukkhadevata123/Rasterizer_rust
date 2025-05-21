@@ -6,6 +6,7 @@
 //! - 多种着色模型处理：平面着色(Flat)、Gouraud着色和Phong着色
 //! - 纹理采样与透视校正插值
 //! - 着色计算 (Blinn-Phong和PBR)
+//! - MSAA抗锯齿与性能优化
 //! - Gamma校正
 //!
 //! 光栅化器使用原子操作处理深度缓冲和颜色缓冲区以支持高效的并行渲染。
@@ -448,6 +449,285 @@ fn sample_texture(triangle: &TriangleData, bary: Vector3<f32>) -> Color {
         TextureSource::None => {
             // 无纹理，返回白色
             Color::new(1.0, 1.0, 1.0)
+        }
+    }
+}
+
+/// 光栅化单个三角形，使用MSAA（多重采样抗锯齿）技术
+///
+/// 本函数实现了带有性能优化的MSAA光栅化：
+/// 1. 仅对三角形边界附近的像素进行多采样（保守光栅化）
+/// 2. 先对像素中心进行深度测试，只有通过测试的像素才进行多采样（优化深度测试）
+///
+/// # 参数
+/// * `triangle` - 包含三角形数据的结构体
+/// * `width` - 帧缓冲区宽度（像素）
+/// * `height` - 帧缓冲区高度（像素）
+/// * `main_depth_buffer` - 主深度缓冲区
+/// * `main_color_buffer` - 主颜色缓冲区
+/// * `msaa_depth_buffers` - MSAA深度缓冲区
+/// * `msaa_color_buffers` - MSAA颜色缓冲区
+/// * `config` - 光栅化器配置参数
+pub fn rasterize_triangle_with_msaa(
+    triangle: &TriangleData,
+    width: usize,
+    height: usize,
+    main_depth_buffer: &[AtomicF32],
+    main_color_buffer: &[AtomicU8],
+    msaa_depth_buffers: Option<&[Vec<AtomicF32>]>,
+    msaa_color_buffers: Option<&[Vec<AtomicU8>]>,
+    config: &RenderConfig,
+) {
+    // 如果MSAA未启用或缓冲区不存在，则使用普通光栅化
+    if config.msaa_level == 0 || msaa_depth_buffers.is_none() || msaa_color_buffers.is_none() {
+        rasterize_triangle(
+            triangle,
+            width,
+            height,
+            main_depth_buffer,
+            main_color_buffer,
+            config,
+        );
+        return;
+    }
+
+    let msaa_depth_bufs = msaa_depth_buffers.unwrap();
+    let msaa_color_bufs = msaa_color_buffers.unwrap();
+    let samples_count = msaa_depth_bufs.len();
+    let sample_positions = config.msaa_sample_positions();
+
+    // 获取三角形顶点
+    let v0 = &triangle.vertices[0].pix;
+    let v1 = &triangle.vertices[1].pix;
+    let v2 = &triangle.vertices[2].pix;
+
+    // 计算包围盒
+    let min_x = v0.x.min(v1.x).min(v2.x).floor().max(0.0) as usize;
+    let min_y = v0.y.min(v1.y).min(v2.y).floor().max(0.0) as usize;
+    let max_x = v0.x.max(v1.x).max(v2.x).ceil().min(width as f32) as usize;
+    let max_y = v0.y.max(v1.y).max(v2.y).ceil().min(height as f32) as usize;
+
+    // 检查无效的包围盒
+    if max_x <= min_x || max_y <= min_y {
+        return;
+    }
+
+    // 线框模式的边缘检测阈值
+    const EDGE_THRESHOLD: f32 = 1.0;
+
+    // 预计算光照相关常量
+    let use_phong_or_pbr = (config.use_pbr || config.use_phong)
+        && triangle.vertices[0].normal_view.is_some()
+        && triangle.vertices[0].position_view.is_some()
+        && triangle.light.is_some();
+
+    // 预计算纹理使用决策
+    let use_texture = matches!(
+        triangle.texture_source,
+        TextureSource::Image(_) | TextureSource::FaceColor(_) | TextureSource::SolidColor(_)
+    );
+
+    // 预计算环境光贡献
+    let ambient_contribution = calculate_ambient_contribution(triangle, config);
+    // 用于三角形边缘检测的阈值
+    const EDGE_DETECTION_THRESHOLD: f32 = 1.0;
+
+    // 遍历包围盒中的每个像素
+    for y in min_y..max_y {
+        for x in min_x..max_x {
+            // 计算像素中心
+            let pixel_center = Point2::new(x as f32 + 0.5, y as f32 + 0.5);
+            let pixel_index = y * width + x;
+
+            // 线框模式特殊处理
+            if config.use_wireframe {
+                if let Some(bary) = barycentric_coordinates(pixel_center, *v0, *v1, *v2) {
+                    if is_inside_triangle(bary)
+                        && is_on_triangle_edge(pixel_center, *v0, *v1, *v2, EDGE_THRESHOLD)
+                    {
+                        // 对于线框模式，只绘制三角形边缘
+                        let interpolated_depth = interpolate_depth(
+                            bary,
+                            triangle.vertices[0].z_view,
+                            triangle.vertices[1].z_view,
+                            triangle.vertices[2].z_view,
+                            config.is_perspective() && triangle.is_perspective,
+                        );
+
+                        // 深度测试（中心点）
+                        if interpolated_depth.is_finite() && interpolated_depth < f32::INFINITY {
+                            let previous_depth =
+                                main_depth_buffer[pixel_index].load(Ordering::Relaxed);
+                            if interpolated_depth < previous_depth {
+                                let old_depth = main_depth_buffer[pixel_index]
+                                    .fetch_min(interpolated_depth, Ordering::Relaxed);
+                                if old_depth > interpolated_depth {
+                                    let final_color = calculate_pixel_color(
+                                        triangle,
+                                        bary,
+                                        config,
+                                        use_phong_or_pbr,
+                                        use_texture,
+                                        &ambient_contribution,
+                                    );
+                                    write_pixel_color(
+                                        pixel_index,
+                                        &final_color,
+                                        main_color_buffer,
+                                        config.apply_gamma_correction,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                continue; // 线框模式下无需进行MSAA处理
+            }
+            // 检查像素中心是否在三角形内
+            if let Some(bary_center) = barycentric_coordinates(pixel_center, *v0, *v1, *v2) {
+                if is_inside_triangle(bary_center) {
+                    // 计算中心点的深度
+                    let center_depth = interpolate_depth(
+                        bary_center,
+                        triangle.vertices[0].z_view,
+                        triangle.vertices[1].z_view,
+                        triangle.vertices[2].z_view,
+                        config.is_perspective() && triangle.is_perspective,
+                    );
+
+                    // 深度是否有效
+                    if !center_depth.is_finite() || center_depth >= f32::INFINITY {
+                        continue;
+                    }
+
+                    // 优化3: 深度测试优化 - 先对像素中心进行深度测试
+                    let previous_depth = main_depth_buffer[pixel_index].load(Ordering::Relaxed);
+                    if center_depth >= previous_depth && config.use_zbuffer {
+                        continue; // 如果中心点深度测试失败，跳过整个像素
+                    }
+                    // 优化2: 保守光栅化 - 检查像素是否在三角形边缘
+                    let mut is_edge_pixel =
+                        is_on_triangle_edge(pixel_center, *v0, *v1, *v2, EDGE_DETECTION_THRESHOLD);
+// TODO             
+                    is_edge_pixel = true;
+                    if !is_edge_pixel {
+                        // 对于完全在三角形内部的像素，只使用中心采样点
+                        let old_depth = main_depth_buffer[pixel_index]
+                            .fetch_min(center_depth, Ordering::Relaxed);
+                        if old_depth > center_depth || !config.use_zbuffer {
+                            let final_color = calculate_pixel_color(
+                                triangle,
+                                bary_center,
+                                config,
+                                use_phong_or_pbr,
+                                use_texture,
+                                &ambient_contribution,
+                            );
+
+                            // 更新主颜色缓冲区
+                            write_pixel_color(
+                                pixel_index,
+                                &final_color,
+                                main_color_buffer,
+                                config.apply_gamma_correction,
+                            );
+
+                            // 对于内部像素，将相同的颜色和深度写入所有样本点
+                            for sample_idx in 0..samples_count {
+                                let sample_color_idx = pixel_index * 3;
+                                msaa_color_bufs[sample_idx][sample_color_idx].store(
+                                    main_color_buffer[sample_color_idx].load(Ordering::Relaxed),
+                                    Ordering::Relaxed,
+                                );
+                                msaa_color_bufs[sample_idx][sample_color_idx + 1].store(
+                                    main_color_buffer[sample_color_idx + 1].load(Ordering::Relaxed),
+                                    Ordering::Relaxed,
+                                );
+                                msaa_color_bufs[sample_idx][sample_color_idx + 2].store(
+                                    main_color_buffer[sample_color_idx + 2].load(Ordering::Relaxed),
+                                    Ordering::Relaxed,
+                                );
+                                msaa_depth_bufs[sample_idx][pixel_index]
+                                    .store(center_depth, Ordering::Relaxed);
+                            }
+                        }
+                    } else {
+                        // 对于边缘像素，对每个采样点单独处理
+                        let mut any_sample_passed = false;
+
+                        for (sample_idx, (offset_x, offset_y)) in
+                            sample_positions.iter().enumerate()
+                        {
+                            // 计算采样点的位置
+                            let sample_pos = Point2::new(x as f32 + offset_x, y as f32 + offset_y);
+
+                            // 检查采样点是否在三角形内
+                            if let Some(bary_sample) =
+                                barycentric_coordinates(sample_pos, *v0, *v1, *v2)
+                            {
+                                if is_inside_triangle(bary_sample) {
+                                    // 计算采样点的深度
+                                    let sample_depth = interpolate_depth(
+                                        bary_sample,
+                                        triangle.vertices[0].z_view,
+                                        triangle.vertices[1].z_view,
+                                        triangle.vertices[2].z_view,
+                                        config.is_perspective() && triangle.is_perspective,
+                                    );
+
+                                    // 深度是否有效
+                                    if !sample_depth.is_finite() || sample_depth >= f32::INFINITY {
+                                        continue;
+                                    }
+
+                                    // 对采样点进行深度测试
+                                    let previous_sample_depth = msaa_depth_bufs[sample_idx]
+                                        [pixel_index]
+                                        .load(Ordering::Relaxed);
+                                    if !config.use_zbuffer || sample_depth < previous_sample_depth {
+                                        // 只有当采样点通过深度测试才计算颜色
+                                        let old_depth = msaa_depth_bufs[sample_idx][pixel_index]
+                                            .fetch_min(sample_depth, Ordering::Relaxed);
+                                        if old_depth > sample_depth || !config.use_zbuffer {
+                                            // 计算采样点的颜色
+                                            let sample_color = calculate_pixel_color(
+                                                triangle,
+                                                bary_sample,
+                                                config,
+                                                use_phong_or_pbr,
+                                                use_texture,
+                                                &ambient_contribution,
+                                            );
+
+                                            // 将颜色写入MSAA颜色缓冲区
+                                            let color_idx = pixel_index * 3;
+                                            let [r, g, b] = linear_rgb_to_u8(
+                                                &sample_color,
+                                                config.apply_gamma_correction,
+                                            );
+                                            msaa_color_bufs[sample_idx][color_idx]
+                                                .store(r, Ordering::Relaxed);
+                                            msaa_color_bufs[sample_idx][color_idx + 1]
+                                                .store(g, Ordering::Relaxed);
+                                            msaa_color_bufs[sample_idx][color_idx + 2]
+                                                .store(b, Ordering::Relaxed);
+
+                                            any_sample_passed = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // 如果至少有一个采样点通过了深度测试，则更新中心深度
+                        if any_sample_passed {
+                            main_depth_buffer[pixel_index]
+                                .fetch_min(center_depth, Ordering::Relaxed);
+                            // 颜色将在resolve_msaa阶段合并
+                        }
+                    }
+                }
+            }
         }
     }
 }

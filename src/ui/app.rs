@@ -87,7 +87,7 @@ impl RasterizerApp {
         args_copy.use_pbr = false; // 确保PBR默认关闭
 
         // 创建渲染器
-        let renderer = Renderer::new(args_copy.width, args_copy.height);
+        let renderer = Renderer::new(args_copy.width, args_copy.height, args_copy.msaa_level);
 
         // 检查ffmpeg是否可用
         let ffmpeg_available = Self::check_ffmpeg_available();
@@ -162,14 +162,27 @@ impl RasterizerApp {
         new_args.use_phong = true; // 确保Phong着色默认开启
         new_args.use_pbr = false; // 确保PBR渲染默认关闭
 
-        // 如果宽度或高度发生变化，需要重新创建渲染器
+        // 如果宽度、高度或MSAA级别发生变化，需要重新创建渲染器
         if self.renderer.frame_buffer.width != new_args.width
             || self.renderer.frame_buffer.height != new_args.height
+            || self.args.msaa_level != new_args.msaa_level
         {
-            // 创建新的渲染器，使用新的宽高
-            self.renderer = Renderer::new(new_args.width, new_args.height);
+            // 创建新的渲染器，使用新的宽高和MSAA设置
+            self.renderer = Renderer::new(new_args.width, new_args.height, new_args.msaa_level);
             // 清除已渲染的图像
             self.rendered_image = None;
+            println!(
+                "重新创建渲染器 - 尺寸: {}x{}, MSAA: {}x",
+                new_args.width,
+                new_args.height,
+                match new_args.msaa_level {
+                    0 => 1,
+                    1 => 2,
+                    2 => 4,
+                    3 => 8,
+                    _ => 1,
+                }
+            );
         }
 
         // 更新Args对象

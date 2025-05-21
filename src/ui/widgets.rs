@@ -199,10 +199,30 @@ impl WidgetMethods for RasterizerApp {
                 Self::add_tooltip(resp7, ctx, "应用伽马校正，使亮度显示更准确");
 
                 let resp8 = ui.checkbox(&mut self.args.backface_culling, "背面剔除");
-                Self::add_tooltip(resp8, ctx, "剔除背向相机的三角形面，提高渲染效率");
-
-                let resp9 = ui.checkbox(&mut self.args.wireframe, "线框模式");
+                Self::add_tooltip(resp8, ctx, "剔除背向相机的三角形面，提高渲染效率");                let resp9 = ui.checkbox(&mut self.args.wireframe, "线框模式");
                 Self::add_tooltip(resp9, ctx, "仅渲染三角形边缘，显示为线框");
+
+                // MSAA抗锯齿设置
+                ui.horizontal(|ui| {
+                    ui.label("抗锯齿 (MSAA):");
+                    egui::ComboBox::from_id_salt("msaa_combo")
+                        .selected_text(match self.args.msaa_level {
+                            0 => "关闭",
+                            1 => "2x MSAA",
+                            2 => "4x MSAA", 
+                            3 => "8x MSAA",
+                            _ => "关闭",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.args.msaa_level, 0, "关闭");
+                            ui.selectable_value(&mut self.args.msaa_level, 1, "2x MSAA");
+                            ui.selectable_value(&mut self.args.msaa_level, 2, "4x MSAA");
+                            ui.selectable_value(&mut self.args.msaa_level, 3, "8x MSAA");
+                        });
+
+                    let msaa_resp = ui.label("");
+                    Self::add_tooltip(msaa_resp, ctx, "多重采样抗锯齿，可减少图像边缘的锯齿\n数值越高质量越好，但性能消耗也越大");
+                });
 
                 ui.separator();
                 let resp10 = ui.checkbox(&mut self.args.use_multithreading, "启用多线程渲染");

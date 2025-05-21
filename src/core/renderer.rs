@@ -1,4 +1,6 @@
-use crate::core::rasterizer::{TextureSource, TriangleData, VertexRenderData, rasterize_triangle};
+use crate::core::rasterizer::{
+    TextureSource, TriangleData, VertexRenderData, rasterize_triangle, rasterize_triangle_with_msaa,
+};
 use crate::core::render_config::RenderConfig;
 use crate::geometry::camera::Camera;
 use crate::geometry::culling::{is_backface, should_cull_small_triangle}; // 导入剔除函数
@@ -19,10 +21,16 @@ pub struct FrameBuffer {
     pub depth_buffer: Vec<AtomicF32>,
     /// 存储RGB颜色值 [0, 255]，类型为u8。使用原子类型以支持并行写入。
     pub color_buffer: Vec<AtomicU8>,
+
+    // MSAA相关缓冲区
+    /// 多重采样深度缓冲区，每个采样点一个深度缓冲区
+    pub msaa_depth_buffers: Option<Vec<Vec<AtomicF32>>>,
+    /// 多重采样颜色缓冲区，每个采样点一个颜色缓冲区
+    pub msaa_color_buffers: Option<Vec<Vec<AtomicU8>>>,
 }
 
 impl FrameBuffer {
-    pub fn new(width: usize, height: usize) -> Self {
+    pub fn new(width: usize, height: usize, msaa_level: u8) -> Self {
         let num_pixels = width * height;
 
         // 为深度缓冲区创建原子浮点数向量
@@ -33,11 +41,40 @@ impl FrameBuffer {
         // 使用迭代器创建颜色缓冲区，避免使用vec!宏
         let color_buffer = (0..num_pixels * 3).map(|_| AtomicU8::new(0)).collect();
 
+        // MSAA缓冲区（如果启用）
+        let msaa_samples = match msaa_level {
+            1 => 2,
+            2 => 4,
+            3 => 8,
+            _ => 0,
+        };
+
+        let (msaa_depth_buffers, msaa_color_buffers) = if msaa_samples > 1 {
+            // 为每个采样点创建单独的深度和颜色缓冲区
+            let depth_bufs = (0..msaa_samples)
+                .map(|_| {
+                    (0..num_pixels)
+                        .map(|_| AtomicF32::new(f32::INFINITY))
+                        .collect()
+                })
+                .collect();
+
+            let color_bufs = (0..msaa_samples)
+                .map(|_| (0..num_pixels * 3).map(|_| AtomicU8::new(0)).collect())
+                .collect();
+
+            (Some(depth_bufs), Some(color_bufs))
+        } else {
+            (None, None)
+        };
+
         FrameBuffer {
             width,
             height,
             depth_buffer,
             color_buffer,
+            msaa_depth_buffers,
+            msaa_color_buffers,
         }
     }
 
@@ -47,6 +84,15 @@ impl FrameBuffer {
         self.depth_buffer.par_iter().for_each(|atomic_depth| {
             atomic_depth.store(f32::INFINITY, Ordering::Relaxed);
         });
+
+        // 清除MSAA缓冲区（如果存在）
+        if let Some(msaa_depth_bufs) = &self.msaa_depth_buffers {
+            msaa_depth_bufs.par_iter().for_each(|buffer| {
+                buffer.par_iter().for_each(|atomic_depth| {
+                    atomic_depth.store(f32::INFINITY, Ordering::Relaxed);
+                });
+            });
+        }
 
         // 根据配置绘制背景和地面
         (0..self.height).into_par_iter().for_each(|y| {
@@ -66,7 +112,6 @@ impl FrameBuffer {
                     // 默认黑色背景
                     Vector3::new(0.0, 0.0, 0.0)
                 };
-                // 地面平面处理部分改进 - 结合屏幕空间渲染和射线追踪网格
 
                 // 2. 如果启用地面平面，在下半部分应用地面效果
                 if config.enable_ground_plane {
@@ -213,6 +258,15 @@ impl FrameBuffer {
                 self.color_buffer[color_index].store(color_u8[0], Ordering::Relaxed);
                 self.color_buffer[color_index + 1].store(color_u8[1], Ordering::Relaxed);
                 self.color_buffer[color_index + 2].store(color_u8[2], Ordering::Relaxed);
+
+                // 如果启用MSAA，将背景颜色复制到MSAA 缓冲区
+                if let Some(msaa_color_bufs) = &self.msaa_color_buffers {
+                    for sample_buf in msaa_color_bufs {
+                        sample_buf[color_index].store(color_u8[0], Ordering::Relaxed);
+                        sample_buf[color_index + 1].store(color_u8[1], Ordering::Relaxed);
+                        sample_buf[color_index + 2].store(color_u8[2], Ordering::Relaxed);
+                    }
+                }
             }
         });
     }
@@ -232,6 +286,134 @@ impl FrameBuffer {
             .map(|atomic_depth| atomic_depth.load(Ordering::Relaxed))
             .collect()
     }
+
+    pub fn resolve_msaa(&self) {
+        // 检查是否有MSAA缓冲区
+        if let (Some(msaa_color_bufs), Some(msaa_depth_bufs)) =
+            (&self.msaa_color_buffers, &self.msaa_depth_buffers)
+        {
+            let samples = msaa_color_bufs.len();
+            if samples <= 1 {
+                return; // 没有MSAA或只有一个样本点
+            }
+
+            let num_pixels = self.width * self.height;
+
+            // 并行处理所有像素
+            (0..num_pixels).into_par_iter().for_each(|pixel_idx| {
+                // 如果所有采样点深度相同，则简单平均颜色
+                let all_same_depth = msaa_depth_bufs
+                    .iter()
+                    .map(|buf| buf[pixel_idx].load(Ordering::Relaxed))
+                    .all(|depth| {
+                        (depth - msaa_depth_bufs[0][pixel_idx].load(Ordering::Relaxed)).abs()
+                            < 0.0001
+                    });
+
+                if all_same_depth {
+                    // 所有采样点深度相似，简单平均颜色
+                    let r_sum = msaa_color_bufs
+                        .iter()
+                        .map(|buf| buf[pixel_idx * 3].load(Ordering::Relaxed) as u32)
+                        .sum::<u32>();
+
+                    let g_sum = msaa_color_bufs
+                        .iter()
+                        .map(|buf| buf[pixel_idx * 3 + 1].load(Ordering::Relaxed) as u32)
+                        .sum::<u32>();
+
+                    let b_sum = msaa_color_bufs
+                        .iter()
+                        .map(|buf| buf[pixel_idx * 3 + 2].load(Ordering::Relaxed) as u32)
+                        .sum::<u32>();
+
+                    // 计算平均值
+                    let r_avg = (r_sum / samples as u32) as u8;
+                    let g_avg = (g_sum / samples as u32) as u8;
+                    let b_avg = (b_sum / samples as u32) as u8;
+
+                    // 写入主颜色缓冲区
+                    self.color_buffer[pixel_idx * 3].store(r_avg, Ordering::Relaxed);
+                    self.color_buffer[pixel_idx * 3 + 1].store(g_avg, Ordering::Relaxed);
+                    self.color_buffer[pixel_idx * 3 + 2].store(b_avg, Ordering::Relaxed);
+                } else {
+                    // 采样点深度不同，说明是边缘像素，需要更智能的混合
+
+                    // 收集所有采样点的颜色和深度
+                    let mut sample_colors = Vec::with_capacity(samples);
+                    let mut sample_depths = Vec::with_capacity(samples);
+
+                    for sample_idx in 0..samples {
+                        let r = msaa_color_bufs[sample_idx][pixel_idx * 3].load(Ordering::Relaxed);
+                        let g =
+                            msaa_color_bufs[sample_idx][pixel_idx * 3 + 1].load(Ordering::Relaxed);
+                        let b =
+                            msaa_color_bufs[sample_idx][pixel_idx * 3 + 2].load(Ordering::Relaxed);
+                        let depth = msaa_depth_bufs[sample_idx][pixel_idx].load(Ordering::Relaxed);
+
+                        sample_colors.push((r, g, b));
+                        sample_depths.push(depth);
+                    }
+
+                    // 对采样点按深度排序
+                    let mut indices: Vec<usize> = (0..samples).collect();
+                    indices
+                        .sort_by(|&a, &b| sample_depths[a].partial_cmp(&sample_depths[b]).unwrap());
+
+                    // 前景色（最近的采样点）
+                    let foreground = sample_colors[indices[0]];
+
+                    // 背景色（其他采样点的平均）
+                    let mut r_sum = 0;
+                    let mut g_sum = 0;
+                    let mut b_sum = 0;
+                    let mut count = 0;
+
+                    for &idx in &indices[1..] {
+                        // 如果深度差异足够大，则视为背景
+                        if sample_depths[idx] - sample_depths[indices[0]] > 0.001 {
+                            let (r, g, b) = sample_colors[idx];
+                            r_sum += r as u32;
+                            g_sum += g as u32;
+                            b_sum += b as u32;
+                            count += 1;
+                        }
+                    }
+
+                    // 如果有背景采样点，进行混合
+                    if count > 0 {
+                        let bg_r = (r_sum / count) as u8;
+                        let bg_g = (g_sum / count) as u8;
+                        let bg_b = (b_sum / count) as u8;
+
+                        // 基于覆盖率的混合
+                        let foreground_coverage =
+                            (indices.len() as u32 - count) as f32 / indices.len() as f32;
+                        let background_coverage = 1.0 - foreground_coverage;
+
+                        let final_r = ((foreground.0 as f32 * foreground_coverage
+                            + bg_r as f32 * background_coverage)
+                            as u32) as u8;
+                        let final_g = ((foreground.1 as f32 * foreground_coverage
+                            + bg_g as f32 * background_coverage)
+                            as u32) as u8;
+                        let final_b = ((foreground.2 as f32 * foreground_coverage
+                            + bg_b as f32 * background_coverage)
+                            as u32) as u8;
+
+                        self.color_buffer[pixel_idx * 3].store(final_r, Ordering::Relaxed);
+                        self.color_buffer[pixel_idx * 3 + 1].store(final_g, Ordering::Relaxed);
+                        self.color_buffer[pixel_idx * 3 + 2].store(final_b, Ordering::Relaxed);
+                    } else {
+                        // 只有前景色
+                        self.color_buffer[pixel_idx * 3].store(foreground.0, Ordering::Relaxed);
+                        self.color_buffer[pixel_idx * 3 + 1].store(foreground.1, Ordering::Relaxed);
+                        self.color_buffer[pixel_idx * 3 + 2].store(foreground.2, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    }
 }
 
 /// 渲染器结构体 - 负责高层次渲染流程
@@ -241,9 +423,9 @@ pub struct Renderer {
 
 impl Renderer {
     /// 创建一个新的渲染器实例
-    pub fn new(width: usize, height: usize) -> Self {
+    pub fn new(width: usize, height: usize, msaa_level: u8) -> Self {
         Renderer {
-            frame_buffer: FrameBuffer::new(width, height),
+            frame_buffer: FrameBuffer::new(width, height, msaa_level),
         }
     }
 
@@ -268,6 +450,11 @@ impl Renderer {
             } else {
                 println!("警告：对象引用了无效的模型 ID {}", object.model_id);
             }
+        }
+
+        // 渲染完成后解析MSAA缓冲区
+        if config.msaa_level > 0 {
+            self.frame_buffer.resolve_msaa();
         }
     }
 
@@ -297,8 +484,9 @@ impl Renderer {
             None
         };
 
-        // --- 几何变换 ---
-        println!("变换顶点...");
+        // --- 准备几何体 ---
+        // 这里我们将模型的缩放、旋转和平移应用到模型的每个顶点上
+        println!("准备几何体...");
         let transform_start_time = Instant::now();
 
         // 使用优化的几何变换函数
@@ -334,37 +522,75 @@ impl Renderer {
             &mesh_vertex_offsets,
             material_override,
             config,
-        );
-
-        // --- 光栅化 ---
+        ); // --- 光栅化 ---
         println!("光栅化网格...");
         let raster_start_time = Instant::now();
 
-        // 光栅化三角形 - 使用配置的多线程设置
-        if config.use_multithreading {
-            // 并行处理所有三角形
-            triangles_to_render.par_iter().for_each(|triangle_data| {
-                rasterize_triangle(
-                    triangle_data,
-                    self.frame_buffer.width,
-                    self.frame_buffer.height,
-                    &self.frame_buffer.depth_buffer,
-                    &self.frame_buffer.color_buffer,
-                    config,
-                );
-            });
+        // 根据配置选择使用普通光栅化还是MSAA光栅化
+        if config.msaa_level > 0
+            && self.frame_buffer.msaa_depth_buffers.is_some()
+            && self.frame_buffer.msaa_color_buffers.is_some()
+        {
+            // 使用MSAA光栅化
+            let msaa_depth_buffers = self.frame_buffer.msaa_depth_buffers.as_ref().unwrap();
+            let msaa_color_buffers = self.frame_buffer.msaa_color_buffers.as_ref().unwrap();
+
+            if config.use_multithreading {
+                // 并行处理所有三角形
+                triangles_to_render.par_iter().for_each(|triangle_data| {
+                    rasterize_triangle_with_msaa(
+                        triangle_data,
+                        self.frame_buffer.width,
+                        self.frame_buffer.height,
+                        &self.frame_buffer.depth_buffer,
+                        &self.frame_buffer.color_buffer,
+                        Some(msaa_depth_buffers.as_slice()),
+                        Some(msaa_color_buffers.as_slice()),
+                        config,
+                    );
+                });
+            } else {
+                // 串行处理所有三角形
+                triangles_to_render.iter().for_each(|triangle_data| {
+                    rasterize_triangle_with_msaa(
+                        triangle_data,
+                        self.frame_buffer.width,
+                        self.frame_buffer.height,
+                        &self.frame_buffer.depth_buffer,
+                        &self.frame_buffer.color_buffer,
+                        Some(msaa_depth_buffers.as_slice()),
+                        Some(msaa_color_buffers.as_slice()),
+                        config,
+                    );
+                });
+            }
         } else {
-            // 串行处理所有三角形
-            triangles_to_render.iter().for_each(|triangle_data| {
-                rasterize_triangle(
-                    triangle_data,
-                    self.frame_buffer.width,
-                    self.frame_buffer.height,
-                    &self.frame_buffer.depth_buffer,
-                    &self.frame_buffer.color_buffer,
-                    config,
-                );
-            });
+            // 使用普通光栅化
+            if config.use_multithreading {
+                // 并行处理所有三角形
+                triangles_to_render.par_iter().for_each(|triangle_data| {
+                    rasterize_triangle(
+                        triangle_data,
+                        self.frame_buffer.width,
+                        self.frame_buffer.height,
+                        &self.frame_buffer.depth_buffer,
+                        &self.frame_buffer.color_buffer,
+                        config,
+                    );
+                });
+            } else {
+                // 串行处理所有三角形
+                triangles_to_render.iter().for_each(|triangle_data| {
+                    rasterize_triangle(
+                        triangle_data,
+                        self.frame_buffer.width,
+                        self.frame_buffer.height,
+                        &self.frame_buffer.depth_buffer,
+                        &self.frame_buffer.color_buffer,
+                        config,
+                    );
+                });
+            }
         }
 
         // --- 性能统计 ---

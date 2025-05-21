@@ -108,6 +108,10 @@ pub struct Args {
     #[arg(long, default_value_t = true)]
     pub use_gamma: bool,
 
+    /// 抗锯齿级别：0=禁用，1=2xMSAA，2=4xMSAA，3=8xMSAA
+    #[arg(long, default_value_t = 0)]
+    pub msaa_level: u8,
+
     /// 启用背面剔除
     #[arg(long, default_value_t = false)]
     pub backface_culling: bool,

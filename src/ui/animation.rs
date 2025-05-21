@@ -94,7 +94,7 @@ impl AnimationMethods for RasterizerApp {
         if self.renderer.frame_buffer.width != self.args.width
             || self.renderer.frame_buffer.height != self.args.height
         {
-            self.renderer = Renderer::new(self.args.width, self.args.height);
+            self.renderer = Renderer::new(self.args.width, self.args.height, self.args.msaa_level);
             self.rendered_image = None;
             println!(
                 "重新创建渲染器，尺寸: {}x{}",
@@ -209,8 +209,11 @@ impl AnimationMethods for RasterizerApp {
 
                 let thread_handle = thread::spawn(move || {
                     let mut scene_copy = scene_clone;
-                    let thread_renderer =
-                        Renderer::new(args_for_thread.width, args_for_thread.height);
+                    let thread_renderer = Renderer::new(
+                        args_for_thread.width,
+                        args_for_thread.height,
+                        args_for_thread.msaa_level,
+                    );
 
                     // 使用通用函数计算旋转角度
                     let rotation_per_frame_rad = calculate_frame_rotation(
@@ -335,7 +338,7 @@ impl AnimationMethods for RasterizerApp {
 
                 thread::spawn(move || {
                     let mut scene_copy = scene_clone;
-                    let thread_renderer = Renderer::new(width, height);
+                    let thread_renderer = Renderer::new(width, height, args_for_thread.msaa_level);
 
                     // 计算每帧旋转增量
                     let rotation_increment_rad_per_frame = (360.0 / frames_to_render as f32)
