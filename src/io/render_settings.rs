@@ -221,6 +221,27 @@ pub struct RenderSettings {
     #[arg(long, default_value = "0.0,0.0,0.0")]
     pub emissive: String,
 
+    // ===== 阴影设置 =====
+    /// 启用阴影映射
+    #[arg(long, default_value_t = false)]
+    pub use_shadow_mapping: bool,
+
+    /// 阴影贴图分辨率
+    #[arg(long, default_value_t = 1024)]
+    pub shadow_map_size: usize,
+
+    /// 阴影偏移值(解决自阴影问题)
+    #[arg(long, default_value_t = 0.005)]
+    pub shadow_bias: f32,
+
+    /// 阴影软化程度
+    #[arg(long, default_value_t = 2.0)]
+    pub shadow_softness: f32,
+
+    /// 阴影强度
+    #[arg(long, default_value_t = 0.8)]
+    pub shadow_darkness: f32,
+
     // ===== 背景与环境设置 =====
     /// 启用渐变背景
     #[arg(long, default_value_t = false)]
@@ -367,6 +388,11 @@ impl Default for RenderSettings {
             roughness: 0.5,
             ambient_occlusion: 1.0,
             emissive: "0.0,0.0,0.0".to_string(),
+            use_shadow_mapping: false,
+            shadow_map_size: 1024,
+            shadow_bias: 0.005,
+            shadow_softness: 2.0,
+            shadow_darkness: 0.8,
             enable_gradient_background: false,
             gradient_top_color: "0.5,0.7,1.0".to_string(),
             gradient_bottom_color: "0.1,0.2,0.4".to_string(),
@@ -438,71 +464,17 @@ impl RenderSettings {
         self.directional_lights.clear();
         self.point_lights.clear();
 
-        // 根据预设创建光源
-        match self.lighting_preset {
-            LightingPreset::SingleDirectional => {
-                // 添加一个默认的方向光源
-                self.directional_lights.push(DirectionalLightConfig {
-                    enabled: true,
-                    direction: "0,-1,-1".to_string(),
-                    color: "1.0,1.0,1.0".to_string(),
-                    intensity: self.main_light_intensity,
-                });
-            }
-            LightingPreset::ThreeDirectional => {
-                // 添加三个方向光源，从不同角度照亮场景
-                self.directional_lights.push(DirectionalLightConfig {
-                    enabled: true,
-                    direction: "0,-1,-1".to_string(),
-                    color: "1.0,1.0,1.0".to_string(),
-                    intensity: self.main_light_intensity * 0.7,
-                });
-                self.directional_lights.push(DirectionalLightConfig {
-                    enabled: true,
-                    direction: "-1,-0.5,0.2".to_string(),
-                    color: "0.9,0.9,1.0".to_string(),
-                    intensity: self.main_light_intensity * 0.5,
-                });
-                self.directional_lights.push(DirectionalLightConfig {
-                    enabled: true,
-                    direction: "1,-0.5,0.2".to_string(),
-                    color: "1.0,0.9,0.8".to_string(),
-                    intensity: self.main_light_intensity * 0.3,
-                });
-            }
-            LightingPreset::MixedComplete => {
-                // 添加一个主方向光源
-                self.directional_lights.push(DirectionalLightConfig {
-                    enabled: true,
-                    direction: "0,-1,-1".to_string(),
-                    color: "1.0,1.0,1.0".to_string(),
-                    intensity: self.main_light_intensity * 0.6,
-                });
+        // 使用 light.rs 中的函数获取预设的光源配置
+        let (new_directional_lights, new_point_lights) =
+            crate::material_system::light::create_light_configs_from_preset(
+                self.lighting_preset.clone(),
+                self.main_light_intensity,
+                self.use_shadow_mapping,
+            );
 
-                // 添加四个点光源
-                let point_configs = [
-                    ("2,3,2", "1.0,0.8,0.6"),   // 暖色调
-                    ("-2,3,2", "0.6,0.8,1.0"),  // 冷色调
-                    ("2,3,-2", "0.8,1.0,0.8"),  // 绿色调
-                    ("-2,3,-2", "1.0,0.8,1.0"), // 紫色调
-                ];
-
-                for (pos, color) in &point_configs {
-                    self.point_lights.push(PointLightConfig {
-                        enabled: true,
-                        position: pos.to_string(),
-                        color: color.to_string(),
-                        intensity: self.main_light_intensity * 0.5,
-                        constant_attenuation: 1.0,
-                        linear_attenuation: 0.09,
-                        quadratic_attenuation: 0.032,
-                    });
-                }
-            }
-            LightingPreset::None => {
-                // 不添加任何光源
-            }
-        }
+        // 将生成的配置添加到设置中
+        self.directional_lights.extend(new_directional_lights);
+        self.point_lights.extend(new_point_lights);
 
         // 确保光源数组长度正确
         self.ensure_light_arrays();
@@ -551,20 +523,33 @@ impl RenderSettings {
     /// 根据配置更新实际的光源列表
     pub fn update_lights(&mut self) {
         if self.directional_lights.is_empty() && self.point_lights.is_empty() {
-            // 使用预设创建光源
-            self.lights =
-                create_lights_from_preset(self.lighting_preset.clone(), self.main_light_intensity);
+            // 使用预设创建光源，传递阴影映射设置
+            self.lights = create_lights_from_preset(
+                self.lighting_preset.clone(),
+                self.main_light_intensity,
+                self.use_shadow_mapping,
+            );
         } else {
-            // 使用现有配置创建光源
-            self.lights = create_lights_from_configs(&self.directional_lights, &self.point_lights);
+            // 使用现有配置创建光源，传递阴影映射设置
+            self.lights = create_lights_from_configs(
+                &self.directional_lights,
+                &self.point_lights,
+                self.use_shadow_mapping,
+            );
         }
 
         // 确保至少有一个默认光源
         if self.lights.is_empty() && self.use_lighting {
             let default_direction = Vector3::new(0.0, -1.0, -1.0).normalize();
             let default_color = Vector3::new(1.0, 1.0, 1.0);
-            self.lights
-                .push(Light::directional(default_direction, default_color, 0.8));
+            let mut light = Light::directional(default_direction, default_color, 0.8);
+
+            // 如果启用阴影映射，为默认光源启用阴影
+            if self.use_shadow_mapping {
+                light = light.with_shadow();
+            }
+
+            self.lights.push(light);
         }
     }
 

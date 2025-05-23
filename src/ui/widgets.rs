@@ -459,6 +459,54 @@ impl WidgetMethods for RasterizerApp {
                             });
                         }
                     });
+                    // 阴影映射设置
+                    ui.collapsing("阴影映射设置", |ui| {
+                        let resp = ui.checkbox(&mut self.settings.use_shadow_mapping, "启用阴影映射");
+                        Self::add_tooltip(resp, ctx, "启用阴影映射，让光源产生阴影效果");
+
+                        // 仅当启用阴影映射时才显示其他选项
+                        if self.settings.use_shadow_mapping {
+                            ui.horizontal(|ui| {
+                                ui.label("阴影贴图分辨率:");
+                                let mut shadow_map_size = self.settings.shadow_map_size as i32;
+                                let resp = ui.add(
+                                    egui::Slider::new(&mut shadow_map_size, 512..=4096)
+                                        .step_by(512.0)
+                                        .custom_formatter(|n, _| format!("{}x{}", n, n))
+                                );
+                                self.settings.shadow_map_size = shadow_map_size as usize;
+                                Self::add_tooltip(resp, ctx, "阴影贴图的分辨率，更高的值提供更精细的阴影，但会降低性能");
+                            });
+
+                            ui.horizontal(|ui| {
+                                ui.label("阴影偏移值:");
+                                let resp = ui.add(
+                                    egui::Slider::new(&mut self.settings.shadow_bias, 0.0001..=0.01)
+                                        .logarithmic(true)
+                                );
+                                Self::add_tooltip(resp, ctx, "解决阴影痤疮(shadow acne)问题的偏移值\n较小的值会产生更精确但可能有痤疮的阴影\n较大的值会消除痤疮但可能导致悬浮阴影");
+                            });
+
+                            ui.horizontal(|ui| {
+                                ui.label("阴影软化程度:");
+                                let resp = ui.add(egui::Slider::new(&mut self.settings.shadow_softness, 0.0..=10.0));
+                                Self::add_tooltip(resp, ctx, "控制阴影边缘的软化程度\n0表示硬阴影，较高的值产生更柔和的阴影边缘");
+                            });
+
+                            ui.horizontal(|ui| {
+                                ui.label("阴影强度:");
+                                let resp = ui.add(egui::Slider::new(&mut self.settings.shadow_darkness, 0.0..=1.0));
+                                Self::add_tooltip(resp, ctx, "控制阴影的黑度/不透明度\n0表示完全透明的阴影，1表示完全黑的阴影");
+                            });
+
+                            // 添加一些提示信息
+                            ui.separator();
+                            ui.label(RichText::new("提示：").strong());
+                            ui.label("• 阴影仅适用于方向光源");
+                            ui.label("• 较高的阴影贴图分辨率会显著影响性能");
+                            ui.label("• 如果启用了地面平面，阴影会投射在地面上");
+                        }
+                    });
                 }
             });
 

@@ -43,7 +43,7 @@ where
     F: FnMut(usize, Vec<u8>),
 {
     // 创建线程渲染器
-    let thread_renderer = Renderer::new(width, height);
+    let mut thread_renderer = Renderer::new(width, height);
 
     // 计算旋转参数
     let (effective_rotation_speed_dps, _, frames_to_render) =

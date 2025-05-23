@@ -26,7 +26,7 @@ const BASE_SPEED: f32 = 60.0; // 1s旋转60度
 pub fn render_single_frame(
     settings: &RenderSettings, // 替换为RenderSettings
     scene: &Scene,
-    renderer: &Renderer,
+    renderer: &mut Renderer,
     render_settings: &RenderSettings, // 用于渲染的配置
     output_name: &str,
 ) -> Result<(), String> {
@@ -164,7 +164,7 @@ pub fn calculate_rotation_parameters(rotation_speed: f32, fps: usize) -> (f32, f
 pub fn run_animation_loop(
     settings: &RenderSettings, // 替换为RenderSettings
     scene: &mut Scene,
-    renderer: &Renderer,
+    renderer: &mut Renderer,
 ) -> Result<(), String> {
     // 使用通用函数计算旋转参数
     let (effective_rotation_speed_dps, _, frames_to_render) =

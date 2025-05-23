@@ -54,11 +54,11 @@ fn main() -> Result<(), String> {
     }
 
     // --- 创建渲染器 ---
-    let renderer = Renderer::new(settings.width, settings.height);
+    let mut renderer = Renderer::new(settings.width, settings.height);
 
     // --- 渲染动画或单帧 ---
     if settings.animate {
-        run_animation_loop(&settings, &mut scene, &renderer)?;
+        run_animation_loop(&settings, &mut scene, &mut renderer)?;
     } else {
         println!("--- 准备单帧渲染 ---");
         // 创建配置副本并从场景更新它
@@ -74,7 +74,7 @@ fn main() -> Result<(), String> {
         render_single_frame(
             &settings,
             &scene,
-            &renderer,
+            &mut renderer,
             &render_settings,
             &settings.output,
         )?;

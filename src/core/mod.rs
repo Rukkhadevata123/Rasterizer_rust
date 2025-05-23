@@ -2,3 +2,4 @@
 // 导出核心渲染系统模块
 pub mod rasterizer;
 pub mod renderer;
+pub mod shadow_mapping;

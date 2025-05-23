@@ -278,6 +278,7 @@ impl Scene {
             let preset_lights = crate::material_system::light::create_lights_from_preset(
                 settings.lighting_preset.clone(),
                 settings.main_light_intensity,
+                settings.use_shadow_mapping, // 添加阴影映射参数
             );
 
             for light in preset_lights {
@@ -285,24 +286,15 @@ impl Scene {
             }
         } else {
             // 否则使用配置的光源
-            // 添加方向光源
-            for (i, light) in settings.directional_lights.iter().enumerate() {
-                if light.enabled {
-                    match light.to_light() {
-                        Ok(l) => self.lights.push(l),
-                        Err(e) => eprintln!("方向光 #{} 配置错误: {}", i + 1, e),
-                    }
-                }
-            }
+            // 使用create_lights_from_configs函数，传递阴影映射设置
+            let config_lights = crate::material_system::light::create_lights_from_configs(
+                &settings.directional_lights,
+                &settings.point_lights,
+                settings.use_shadow_mapping, // 添加阴影映射参数
+            );
 
-            // 添加点光源
-            for (i, light) in settings.point_lights.iter().enumerate() {
-                if light.enabled {
-                    match light.to_light() {
-                        Ok(l) => self.lights.push(l),
-                        Err(e) => eprintln!("点光源 #{} 配置错误: {}", i + 1, e),
-                    }
-                }
+            for light in config_lights {
+                self.lights.push(light);
             }
         }
 
@@ -310,10 +302,111 @@ impl Scene {
         if self.lights.is_empty() {
             let default_direction = Vector3::new(0.0, -1.0, -1.0).normalize();
             let default_color = Vector3::new(1.0, 1.0, 1.0);
-            self.add_light(Light::directional(default_direction, default_color, 0.8));
+            let mut light = Light::directional(default_direction, default_color, 0.8);
+
+            // 如果启用阴影映射，为默认光源启用阴影
+            if settings.use_shadow_mapping {
+                light = light.with_shadow();
+            }
+
+            self.add_light(light);
         }
 
         println!("已设置 {} 个光源", self.lights.len());
         Ok(())
+    }
+
+    /// 计算场景的包围球
+    ///
+    /// 返回包围球的中心点和半径，用于阴影映射计算
+    /// 考虑到地面是在FrameBuffer.clear中实现的而非场景对象
+    pub fn calculate_scene_bounds(scene: &Scene, settings: &RenderSettings) -> (Point3<f32>, f32) {
+        // 如果场景为空，返回默认值
+        if scene.objects.is_empty() {
+            return (Point3::new(0.0, 0.0, 0.0), 5.0);
+        }
+
+        // 初始化为极端值
+        let mut min_point = Point3::new(f32::MAX, f32::MAX, f32::MAX);
+        let mut max_point = Point3::new(f32::MIN, f32::MIN, f32::MIN);
+
+        // 遍历所有对象
+        for object in &scene.objects {
+            // 获取对象对应的模型数据
+            let model = &scene.models[object.model_id];
+
+            // 遍历模型中的所有网格
+            for mesh in &model.meshes {
+                // 遍历网格中的所有顶点
+                for vertex in &mesh.vertices {
+                    // 获取顶点位置并应用对象变换
+                    let world_vertex = object.transform.transform_point(&vertex.position);
+
+                    // 更新包围盒
+                    min_point.x = min_point.x.min(world_vertex.x);
+                    min_point.y = min_point.y.min(world_vertex.y);
+                    min_point.z = min_point.z.min(world_vertex.z);
+
+                    max_point.x = max_point.x.max(world_vertex.x);
+                    max_point.y = max_point.y.max(world_vertex.y);
+                    max_point.z = max_point.z.max(world_vertex.z);
+                }
+            }
+        }
+
+        // 计算包围盒中心点
+        let center = Point3::new(
+            (min_point.x + max_point.x) * 0.5,
+            (min_point.y + max_point.y) * 0.5,
+            (min_point.z + max_point.z) * 0.5,
+        );
+
+        // 计算包围球半径 - 中心点到包围盒最远角点的距离
+        let mut radius: f32 = 0.0;
+
+        // 遍历所有对象再次计算最大半径
+        for object in &scene.objects {
+            let model = &scene.models[object.model_id];
+
+            for mesh in &model.meshes {
+                for vertex in &mesh.vertices {
+                    let world_vertex = object.transform.transform_point(&vertex.position);
+                    let distance = nalgebra::distance(&center, &world_vertex);
+                    radius = radius.max(distance);
+                }
+            }
+        }
+
+        // 给半径增加一点余量，确保包含所有内容
+        radius *= 1.05;
+
+        // 如果启用了地面平面，确保地面也被包含在包围球内
+        if settings.enable_ground_plane {
+            // 将地面平面的高度考虑进去
+            let ground_y = settings.ground_plane_height;
+
+            // 计算中心到地面的距离
+            let ground_distance = (center.y - ground_y).abs();
+
+            // 确保半径足够大，能够包含地面
+            radius = radius.max(ground_distance);
+
+            // 扩展包围盒，使其能包含地面上的物体阴影
+            // 假设阴影能投射的最大距离是物体高度的2倍
+            let max_height = max_point.y - ground_y;
+            let shadow_extent = max_height * 2.0;
+
+            // 扩展半径以包含阴影
+            let horizontal_extent = (radius.powi(2) - (center.y - ground_y).powi(2)).sqrt();
+            let required_extent = horizontal_extent + shadow_extent;
+            let required_radius = ((center.y - ground_y).powi(2) + required_extent.powi(2)).sqrt();
+
+            radius = radius.max(required_radius);
+        }
+
+        // 确保有最小半径，即使场景很小
+        radius = radius.max(3.0);
+
+        (center, radius)
     }
 }

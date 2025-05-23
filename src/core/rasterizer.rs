@@ -6,16 +6,18 @@
 //! - 多种着色模型处理：平面着色(Flat)、Gouraud着色和Phong着色
 //! - 纹理采样与透视校正插值
 //! - 着色计算 (Blinn-Phong和PBR)
+//! - 阴影映射处理
 //! - Gamma校正
 //!
 //! 光栅化器使用原子操作处理深度缓冲和颜色缓冲区以支持高效的并行渲染。
 
+use crate::core::shadow_mapping::ShadowMapper;
 use crate::geometry::culling::is_on_triangle_edge;
 use crate::geometry::interpolation::{
     barycentric_coordinates, interpolate_depth, interpolate_normal, interpolate_position,
     interpolate_texcoords, is_inside_triangle,
 };
-use crate::io::render_settings::RenderSettings; // 直接导入 RenderSettings
+use crate::io::render_settings::RenderSettings;
 use crate::material_system::color::{Color, linear_rgb_to_u8};
 use crate::material_system::light::Light;
 use crate::material_system::materials::MaterialView;
@@ -27,15 +29,15 @@ use std::sync::atomic::{AtomicU8, Ordering};
 /// 顶点渲染数据，组织单个顶点的所有渲染属性
 #[derive(Debug, Clone)]
 pub struct VertexRenderData {
-    pub pix: Point2<f32>,                   // 屏幕空间坐标 (x,y)
-    pub z_view: f32,                        // 视图空间 z 值
-    pub texcoord: Option<Vector2<f32>>,     // 纹理坐标
-    pub normal_view: Option<Vector3<f32>>,  // 视图空间法线
-    pub position_view: Option<Point3<f32>>, // 视图空间位置
+    pub pix: Point2<f32>,                    // 屏幕空间坐标 (x,y)
+    pub z_view: f32,                         // 视图空间 z 值
+    pub texcoord: Option<Vector2<f32>>,      // 纹理坐标
+    pub normal_view: Option<Vector3<f32>>,   // 视图空间法线
+    pub position_view: Option<Point3<f32>>,  // 视图空间位置
+    pub position_world: Option<Point3<f32>>, // 世界空间位置（用于阴影计算）
 }
 
 /// 为 TextureSource 实现 Clone 特性，解决所有权问题
-/// 这使得我们可以在方法之间传递 TextureSource 而不必担心所有权转移
 #[derive(Debug, Clone)]
 pub enum TextureSource<'a> {
     None,
@@ -45,9 +47,6 @@ pub enum TextureSource<'a> {
 }
 
 /// 单个三角形光栅化所需的输入数据
-///
-/// 包含三角形的几何信息（顶点位置、法线）、材质属性、纹理坐标和光照信息。
-/// 所有决策（如使用哪种纹理来源）已经在渲染器中做出。
 pub struct TriangleData<'a> {
     // 三个顶点数据
     pub vertices: [VertexRenderData; 3],
@@ -68,25 +67,12 @@ pub struct TriangleData<'a> {
 
     // 渲染设置
     pub is_perspective: bool, // 是否使用透视投影
+
+    // 阴影映射相关
+    pub shadow_mapper: Option<&'a ShadowMapper>, // 阴影映射器引用
 }
 
 /// 光栅化单个三角形到帧缓冲区
-///
-/// 该函数实现了三角形光栅化的核心算法，包括：
-/// 1. 计算三角形包围盒
-/// 2. 对包围盒中的每个像素进行处理
-/// 3. 计算重心坐标，判断像素是否在三角形内
-/// 4. 对于三角形内的像素，进行深度测试
-/// 5. 计算最终颜色（基于着色模型、纹理和光照）
-/// 6. 写入颜色到帧缓冲区
-///
-/// # 参数
-/// * `triangle` - 包含三角形数据的结构体
-/// * `width` - 帧缓冲区宽度（像素）
-/// * `height` - 帧缓冲区高度（像素）
-/// * `depth_buffer` - 深度缓冲区（使用原子操作支持并行）
-/// * `color_buffer` - 颜色缓冲区（使用原子操作支持并行）
-/// * `settings` - 渲染设置参数
 pub fn rasterize_triangle(
     triangle: &TriangleData,
     width: usize,
@@ -95,23 +81,22 @@ pub fn rasterize_triangle(
     color_buffer: &[AtomicU8],
     settings: &RenderSettings,
 ) {
-    // 1. 计算三角形包围盒 - 优化实现，减少重复计算
+    // 1. 计算三角形包围盒
     let v0 = &triangle.vertices[0].pix;
     let v1 = &triangle.vertices[1].pix;
     let v2 = &triangle.vertices[2].pix;
 
-    // 使用SIMD友好的min/max计算
     let min_x = v0.x.min(v1.x).min(v2.x).floor().max(0.0) as usize;
     let min_y = v0.y.min(v1.y).min(v2.y).floor().max(0.0) as usize;
     let max_x = v0.x.max(v1.x).max(v2.x).ceil().min(width as f32) as usize;
     let max_y = v0.y.max(v1.y).max(v2.y).ceil().min(height as f32) as usize;
 
-    // 检查无效的包围盒（宽度或高度为0）
+    // 检查无效的包围盒
     if max_x <= min_x || max_y <= min_y {
         return;
     }
 
-    // 线框模式的边缘检测阈值（像素单位）
+    // 线框模式的边缘检测阈值
     const EDGE_THRESHOLD: f32 = 1.0;
 
     // 预计算与光照相关的常量
@@ -126,7 +111,10 @@ pub fn rasterize_triangle(
         TextureSource::Image(_) | TextureSource::FaceColor(_) | TextureSource::SolidColor(_)
     );
 
-    // 提前计算环境光贡献，避免每个像素重复计算
+    // 预计算阴影使用决策
+    let use_shadows = settings.use_shadow_mapping && triangle.shadow_mapper.is_some();
+
+    // 提前计算环境光贡献
     let ambient_contribution = calculate_ambient_contribution(triangle);
 
     // 2. 遍历包围盒中的每个像素
@@ -156,12 +144,12 @@ pub fn rasterize_triangle(
                         settings.is_perspective() && triangle.is_perspective,
                     );
 
-                    // 检查深度是否有效（不在相机后方且不太远）
+                    // 检查深度是否有效
                     if interpolated_depth.is_finite() && interpolated_depth < f32::INFINITY {
                         // 6. 深度测试（使用原子操作）
                         let current_depth_atomic = &depth_buffer[pixel_index];
 
-                        // 优化深度测试逻辑，减少原子操作
+                        // 优化深度测试逻辑
                         if !settings.use_zbuffer {
                             // 不使用深度测试，直接更新颜色
                             let final_color = calculate_pixel_color(
@@ -170,6 +158,7 @@ pub fn rasterize_triangle(
                                 settings,
                                 use_phong_or_pbr,
                                 use_texture,
+                                use_shadows,
                                 &ambient_contribution,
                             );
                             write_pixel_color(
@@ -195,6 +184,7 @@ pub fn rasterize_triangle(
                                         settings,
                                         use_phong_or_pbr,
                                         use_texture,
+                                        use_shadows,
                                         &ambient_contribution,
                                     );
                                     write_pixel_color(
@@ -232,29 +222,13 @@ fn write_pixel_color(
 }
 
 /// 计算像素的最终颜色值
-///
-/// 根据三角形数据、重心坐标和配置参数计算像素颜色。
-/// 处理三种主要的着色模式：
-/// 1. PBR 着色（基于物理的渲染）
-/// 2. Phong着色（逐像素光照计算）
-/// 3. 预计算光照（Flat或Gouraud着色）
-///
-/// # 参数
-/// * `triangle` - 三角形数据
-/// * `bary` - 像素的重心坐标
-/// * `settings` - 渲染设置
-/// * `use_phong_or_pbr` - 是否使用Phong或PBR着色（预计算的标志）
-/// * `use_texture` - 是否使用纹理（预计算的标志）
-/// * `ambient_contribution` - 预计算的环境光贡献
-///
-/// # 返回值
-/// 计算得到的像素颜色（线性RGB空间）
 fn calculate_pixel_color(
     triangle: &TriangleData,
     bary: Vector3<f32>,
     settings: &RenderSettings,
     use_phong_or_pbr: bool,
     use_texture: bool,
+    use_shadows: bool,
     ambient_contribution: &Color,
 ) -> Color {
     // 使用传入的基础颜色
@@ -296,6 +270,22 @@ fn calculate_pixel_color(
             triangle.vertices[2].z_view,
         );
 
+        // 插值世界空间位置（用于阴影计算）
+        let interp_world_pos = if use_shadows && triangle.vertices[0].position_world.is_some() {
+            Some(interpolate_position(
+                bary,
+                triangle.vertices[0].position_world.unwrap(),
+                triangle.vertices[1].position_world.unwrap(),
+                triangle.vertices[2].position_world.unwrap(),
+                triangle.is_perspective,
+                triangle.vertices[0].z_view,
+                triangle.vertices[1].z_view,
+                triangle.vertices[2].z_view,
+            ))
+        } else {
+            None
+        };
+
         // 计算视线方向
         let view_dir = (-interp_position.coords).normalize();
 
@@ -311,11 +301,23 @@ fn calculate_pixel_color(
             // 计算材质对该光源的响应
             let response = material_view.compute_response(&light_dir, &view_dir, &interp_normal);
 
-            // 累加该光源的贡献
+            // 计算阴影因子
+            let shadow_factor = if use_shadows && light.casts_shadow() && interp_world_pos.is_some()
+            {
+                // 使用阴影映射器计算阴影因子
+                triangle
+                    .shadow_mapper
+                    .unwrap()
+                    .calculate_soft_shadow(&interp_world_pos.unwrap())
+            } else {
+                1.0 // 无阴影
+            };
+
+            // 累加该光源的贡献（考虑阴影）
             total_direct_light += Vector3::new(
-                response.x * light_intensity.x,
-                response.y * light_intensity.y,
-                response.z * light_intensity.z,
+                response.x * light_intensity.x * shadow_factor,
+                response.y * light_intensity.y * shadow_factor,
+                response.z * light_intensity.z * shadow_factor,
             );
         }
 
@@ -360,7 +362,6 @@ fn calculate_pixel_color(
         // 应用环境光
         if settings.use_lighting {
             // 使用环境光贡献
-            // 注意：在非PBR/Phong模式下只应用环境光
             surface_color.component_mul(ambient_contribution)
         } else {
             // 只使用表面颜色
@@ -370,15 +371,6 @@ fn calculate_pixel_color(
 }
 
 /// 计算环境光贡献
-///
-/// 基于场景环境光设置和材质特性计算环境光贡献
-///
-/// # 参数
-/// * `triangle` - 三角形数据
-/// * `settings` - 渲染设置
-///
-/// # 返回值
-/// 环境光贡献（颜色）
 fn calculate_ambient_contribution(triangle: &TriangleData) -> Color {
     // 获取环境光颜色和强度
     let ambient_color = triangle.ambient_color;
@@ -411,14 +403,7 @@ fn calculate_ambient_contribution(triangle: &TriangleData) -> Color {
     ambient
 }
 
-/// 采样纹理并返回颜色。使用统一的sample方法。
-///
-/// # 参数
-/// * `triangle` - 三角形数据，包含纹理
-/// * `bary` - 像素的重心坐标
-///
-/// # 返回值
-/// 采样得到的颜色（线性RGB空间，[0,1]范围）
+/// 采样纹理并返回颜色
 fn sample_texture(triangle: &TriangleData, bary: Vector3<f32>) -> Color {
     // 根据纹理来源类型处理
     match &triangle.texture_source {

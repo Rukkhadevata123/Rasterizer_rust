@@ -1,10 +1,12 @@
 use crate::core::rasterizer::{TextureSource, TriangleData, VertexRenderData, rasterize_triangle};
+use crate::core::shadow_mapping::ShadowMapper; // 添加阴影映射器引用
 use crate::geometry::camera::Camera;
-use crate::geometry::culling::{is_backface, should_cull_small_triangle}; // 导入剔除函数
+use crate::geometry::culling::{is_backface, should_cull_small_triangle};
 use crate::geometry::transform::transform_pipeline_batch;
-use crate::io::render_settings::RenderSettings; // 从io模块导入RenderSettings
+use crate::io::render_settings::RenderSettings;
 use crate::material_system::materials::{Material, MaterialView, ModelData, Vertex};
 use crate::scene::scene_object::SceneObject;
+use crate::scene::scene_utils::Scene;
 use atomic_float::AtomicF32;
 use nalgebra::{Point2, Point3, Vector3};
 use rayon::prelude::*;
@@ -41,10 +43,8 @@ impl FrameBuffer {
         }
     }
 
-    // 修改 FrameBuffer 的 clear 方法
-
     /// 清除所有缓冲区，并根据配置绘制背景和地面
-    pub fn clear(&self, settings: &RenderSettings) {
+    pub fn clear(&self, settings: &RenderSettings, skip_ground: bool) {
         // 重置深度缓冲区，使用原子操作避免数据竞争
         self.depth_buffer.par_iter().for_each(|atomic_depth| {
             atomic_depth.store(f32::INFINITY, Ordering::Relaxed);
@@ -93,8 +93,8 @@ impl FrameBuffer {
                     final_color = final_color * 0.3 + gradient_color * 0.7;
                 }
 
-                // 3. 如果启用地面平面，在下半部分应用地面效果 - 最高层级
-                if settings.enable_ground_plane {
+                // 3. 如果启用地面平面且未跳过地面渲染，在下半部分应用地面效果
+                if settings.enable_ground_plane && !skip_ground {
                     // 获取地面在世界空间中的Y坐标（高度）
                     let ground_y_world = settings.ground_plane_height;
 
@@ -262,6 +262,7 @@ impl FrameBuffer {
 /// 渲染器结构体 - 负责高层次渲染流程
 pub struct Renderer {
     pub frame_buffer: FrameBuffer,
+    pub shadow_mapper: Option<ShadowMapper>, // 添加阴影映射器
 }
 
 impl Renderer {
@@ -269,19 +270,41 @@ impl Renderer {
     pub fn new(width: usize, height: usize) -> Self {
         Renderer {
             frame_buffer: FrameBuffer::new(width, height),
+            shadow_mapper: None, // 初始无阴影映射器
         }
     }
 
     /// 渲染一个场景，包含多个模型和对象
-    pub fn render_scene(
-        &self,
-        scene: &crate::scene::scene_utils::Scene,
-        settings: &RenderSettings,
-    ) {
-        // 使用场景中的环境光设置
-        // 注意：不需要修改settings中的环境光值，因为这些值将在render_settings中的update_from_scene方法中更新
+    pub fn render_scene(&mut self, scene: &Scene, settings: &RenderSettings) {
+        // 初始化阴影映射器
+        if settings.use_shadow_mapping {
+            // 如果没有阴影映射器或需要重新创建
+            if self.shadow_mapper.is_none() {
+                self.shadow_mapper = Some(ShadowMapper::new(settings));
+            }
 
-        self.frame_buffer.clear(settings);
+            // 获取阴影映射器的可变引用
+            if let Some(shadow_mapper) = &mut self.shadow_mapper {
+                // 为场景中的光源准备阴影映射
+                shadow_mapper.prepare_shadow_maps(scene, settings);
+
+                // 将场景渲染到阴影映射
+                shadow_mapper.render_scene_to_shadow_maps(scene);
+
+                println!(
+                    "阴影映射已准备完成 - 软化程度: {}",
+                    settings.shadow_softness
+                );
+            }
+        } else if self.shadow_mapper.is_some() {
+            // 如果禁用了阴影映射，释放资源
+            self.shadow_mapper = None;
+        }
+
+        // 清除帧缓冲并绘制背景
+        // 使用阴影映射时跳过地面绘制，稍后单独处理地面及其阴影
+        let skip_ground = settings.use_shadow_mapping && settings.enable_ground_plane;
+        self.frame_buffer.clear(settings, skip_ground);
 
         // 逐个渲染场景中的每个对象
         for object in &scene.objects {
@@ -293,10 +316,152 @@ impl Renderer {
                 println!("警告：对象引用了无效的模型 ID {}", object.model_id);
             }
         }
+
+        // 绘制地面（如果启用且使用阴影映射）
+        if settings.enable_ground_plane && settings.use_shadow_mapping {
+            self.render_ground_plane(scene, settings);
+        }
+    }
+
+    /// 渲染地面平面，支持接收阴影
+    fn render_ground_plane(&self, scene: &Scene, settings: &RenderSettings) {
+        if !settings.use_shadow_mapping || self.shadow_mapper.is_none() {
+            return;
+        }
+
+        println!("绘制地面平面并计算阴影...");
+
+        let shadow_mapper = self.shadow_mapper.as_ref().unwrap();
+        let ground_y = settings.ground_plane_height;
+        let height = self.frame_buffer.height;
+        let width = self.frame_buffer.width;
+
+        // 处理下半部分屏幕
+        (height / 2..height).into_par_iter().for_each(|y| {
+            for x in 0..width {
+                let pixel_index = y * width + x;
+                let t_y = y as f32 / (height - 1) as f32;
+                let t_x = x as f32 / (width - 1) as f32;
+
+                // 跳过上半部分屏幕
+                if t_y <= 0.5 {
+                    continue;
+                }
+
+                // 计算世界坐标和地面因子 - 从FrameBuffer.clear复制相关代码
+                let aspect_ratio = width as f32 / height as f32;
+                let camera = &scene.active_camera;
+                let fov_rad = camera.fov_y;
+                let ndc_x = (x as f32 + 0.5) / width as f32 * 2.0 - 1.0;
+                let ndc_y = 1.0 - (y as f32 + 0.5) / height as f32 * 2.0;
+
+                let view_x = ndc_x * aspect_ratio * (fov_rad / 2.0).tan();
+                let view_y = ndc_y * (fov_rad / 2.0).tan();
+                let view_dir = Vector3::new(view_x, view_y, -1.0).normalize();
+
+                let view_to_world = camera
+                    .view_matrix
+                    .try_inverse()
+                    .unwrap_or_else(nalgebra::Matrix4::identity);
+                let world_ray_dir = view_to_world.transform_vector(&view_dir).normalize();
+                let world_ray_origin = camera.position;
+
+                // 计算与地面的交点
+                let ground_normal = Vector3::y();
+                let denominator = ground_normal.dot(&world_ray_dir);
+
+                // 检查是否与地面相交
+                if denominator.abs() <= 1e-6 {
+                    // 射线几乎与地面平行，使用屏幕空间计算
+                    // 保留原有代码...
+                    continue;
+                }
+
+                let t = (Point3::new(0.0, ground_y, 0.0) - world_ray_origin).dot(&ground_normal)
+                    / denominator;
+
+                if t < 0.0 {
+                    continue; // 交点在相机后方
+                }
+
+                // 1. 计算世界空间中的地面交点
+                let ground_point = world_ray_origin + t * world_ray_dir;
+
+                // 2. 计算地面颜色 (从FrameBuffer.clear复制)
+                let mut ground_color = settings.ground_plane_color_vec;
+
+                // 应用地面颜色变化 (复制原有效果)
+                let t_x_centered = (t_x - 0.5) * 2.0;
+                ground_color.x *= 1.0 + t_x_centered * 0.05;
+                ground_color.y *= 1.0 - t_x_centered.abs() * 0.03;
+
+                // 应用大气透视效果
+                let distance_from_center = ((t_x - 0.5).powi(2) + (t_y - 0.75).powi(2)).sqrt();
+                let atmospheric_factor = distance_from_center * 0.2;
+                ground_color = ground_color * (1.0 - atmospheric_factor)
+                    + Vector3::new(0.6, 0.7, 0.9) * atmospheric_factor;
+
+                // 应用反射效果
+                let sky_reflection = settings.gradient_top_color_vec * 0.08;
+                ground_color = ground_color + sky_reflection * (1.0 - (t_y - 0.5) * 1.2).max(0.0);
+
+                // 3. 计算阴影因子
+                let shadow_factor = shadow_mapper.calculate_soft_shadow(&ground_point);
+
+                // 4. 应用阴影到地面颜色
+                let shadow_darkness = settings.shadow_darkness * 0.7;
+                let min_shadow_value = 1.0 - shadow_darkness;
+                let final_shadow_factor = shadow_factor.min(0.95).max(min_shadow_value);
+
+                // 阴影处理
+                ground_color *= final_shadow_factor;
+
+                // 5. 获取背景色
+                let color_index = pixel_index * 3;
+                let mut final_color = Vector3::new(
+                    self.frame_buffer.color_buffer[color_index].load(Ordering::Relaxed) as f32
+                        / 255.0,
+                    self.frame_buffer.color_buffer[color_index + 1].load(Ordering::Relaxed) as f32
+                        / 255.0,
+                    self.frame_buffer.color_buffer[color_index + 2].load(Ordering::Relaxed) as f32
+                        / 255.0,
+                );
+
+                // 6. 混合背景和地面
+                let ground_factor = 1.0; // 因为我们知道这是地面区域，可以使用距离中心等因素调整
+                final_color = final_color * (1.0 - ground_factor) + ground_color * ground_factor;
+
+                // 7. 转换为u8并存储
+                let color_u8 = crate::material_system::color::linear_rgb_to_u8(
+                    &final_color,
+                    settings.use_gamma,
+                );
+
+                // 计算地面点的距离
+                let distance = (ground_point - world_ray_origin).magnitude();
+
+                // 关键修改: 进行深度测试
+                let current_depth =
+                    self.frame_buffer.depth_buffer[pixel_index].load(Ordering::Relaxed);
+
+                if distance < current_depth {
+                    // 更新深度缓冲区
+                    self.frame_buffer.depth_buffer[pixel_index].store(distance, Ordering::Relaxed);
+
+                    // 更新颜色缓冲区
+                    let color_index = pixel_index * 3;
+                    self.frame_buffer.color_buffer[color_index]
+                        .store(color_u8[0], Ordering::Relaxed);
+                    self.frame_buffer.color_buffer[color_index + 1]
+                        .store(color_u8[1], Ordering::Relaxed);
+                    self.frame_buffer.color_buffer[color_index + 2]
+                        .store(color_u8[2], Ordering::Relaxed);
+                }
+            }
+        });
     }
 
     /// 渲染一个场景对象
-    /// 这个方法处理几何变换、可见性剔除和材质准备
     pub fn render(
         &self,
         model_data: &ModelData,
@@ -309,7 +474,6 @@ impl Renderer {
         println!("渲染场景对象...");
 
         // --- 材质准备 ---
-        // 检查是否使用自定义材质
         let material_override = if let Some(material_id) = scene_object.material_id {
             if material_id < model_data.materials.len() {
                 Some(&model_data.materials[material_id])
@@ -326,8 +490,13 @@ impl Renderer {
         let transform_start_time = Instant::now();
 
         // 使用优化的几何变换函数
-        let (all_pixel_coords, all_view_coords, all_view_normals, mesh_vertex_offsets) =
-            self.transform_geometry(model_data, scene_object, camera, settings);
+        let (
+            all_pixel_coords,
+            all_view_coords,
+            all_view_normals,
+            all_world_coords,
+            mesh_vertex_offsets,
+        ) = self.transform_geometry(model_data, scene_object, camera, settings);
 
         let transform_duration = transform_start_time.elapsed();
 
@@ -355,6 +524,7 @@ impl Renderer {
             &all_pixel_coords,
             &all_view_coords,
             &all_view_normals,
+            &all_world_coords, // 添加世界坐标
             &mesh_vertex_offsets,
             material_override,
             settings,
@@ -403,18 +573,14 @@ impl Renderer {
     }
 
     /// 准备三角形数据 - 将几何和材质数据组织为光栅化器可以使用的形式
-    /// 这个阶段处理：
-    /// 1. 视锥剔除（在transform_geometry中完成）
-    /// 2. 背面剔除
-    /// 3. 小三角形剔除
-    /// 4. 纹理和材质决策
     #[allow(clippy::too_many_arguments)]
     fn prepare_triangles<'a>(
-        &self,
+        &'a self,
         model_data: &'a ModelData,
         all_pixel_coords: &[Point2<f32>],
         all_view_coords: &[Point3<f32>],
         all_view_normals: &[Vector3<f32>],
+        all_world_coords: &[Point3<f32>], // 添加世界坐标
         mesh_vertex_offsets: &[usize],
         material_override: Option<&'a Material>,
         settings: &'a RenderSettings,
@@ -423,6 +589,13 @@ impl Renderer {
         let ambient_intensity = settings.ambient;
         let ambient_color = settings.ambient_color_vec;
         let lights = &settings.lights; // 使用RenderSettings中的光源
+
+        // 获取阴影映射器引用
+        let shadow_mapper = if settings.use_shadow_mapping {
+            self.shadow_mapper.as_ref()
+        } else {
+            None
+        };
 
         // 创建要渲染的三角形列表
         model_data
@@ -485,6 +658,11 @@ impl Renderer {
                         let view_pos1 = all_view_coords[global_i1];
                         let view_pos2 = all_view_coords[global_i2];
 
+                        // 获取世界坐标 (用于阴影计算)
+                        let world_pos0 = all_world_coords[global_i0];
+                        let world_pos1 = all_world_coords[global_i1];
+                        let world_pos2 = all_world_coords[global_i2];
+
                         // --- 背面剔除 ---
                         if settings.backface_culling
                             && is_backface(&view_pos0, &view_pos1, &view_pos2)
@@ -529,6 +707,7 @@ impl Renderer {
                             self.create_vertex_render_data(
                                 &pix0,
                                 view_pos0,
+                                world_pos0, // 添加世界坐标
                                 v0,
                                 global_i0,
                                 &texture_source,
@@ -537,6 +716,7 @@ impl Renderer {
                             self.create_vertex_render_data(
                                 &pix1,
                                 view_pos1,
+                                world_pos1, // 添加世界坐标
                                 v1,
                                 global_i1,
                                 &texture_source,
@@ -545,6 +725,7 @@ impl Renderer {
                             self.create_vertex_render_data(
                                 &pix2,
                                 view_pos2,
+                                world_pos2, // 添加世界坐标
                                 v2,
                                 global_i2,
                                 &texture_source,
@@ -562,11 +743,37 @@ impl Renderer {
                             ambient_intensity,
                             ambient_color,
                             is_perspective: settings.is_perspective(),
+                            shadow_mapper, // 添加阴影映射器引用
                         })
                     })
                     .collect::<Vec<_>>() // 在展平前先收集这个网格的所有三角形
             })
             .collect()
+    }
+
+    /// 创建顶点渲染数据
+    fn create_vertex_render_data(
+        &self,
+        pix: &Point2<f32>,
+        view_pos: Point3<f32>,
+        world_pos: Point3<f32>, // 添加世界坐标
+        vertex: &Vertex,
+        global_index: usize,
+        texture_source: &TextureSource,
+        all_view_normals: &[Vector3<f32>],
+    ) -> VertexRenderData {
+        VertexRenderData {
+            pix: Point2::new(pix.x, pix.y),
+            z_view: view_pos.z,
+            texcoord: if matches!(texture_source, TextureSource::Image(_)) {
+                Some(vertex.texcoord)
+            } else {
+                None
+            },
+            normal_view: Some(all_view_normals[global_index]),
+            position_view: Some(view_pos),
+            position_world: Some(world_pos), // 存储世界坐标
+        }
     }
 
     /// 确定纹理来源
@@ -628,29 +835,6 @@ impl Renderer {
         }
     }
 
-    /// 创建顶点渲染数据
-    fn create_vertex_render_data(
-        &self,
-        pix: &Point2<f32>,
-        view_pos: Point3<f32>,
-        vertex: &Vertex,
-        global_index: usize,
-        texture_source: &TextureSource,
-        all_view_normals: &[Vector3<f32>],
-    ) -> VertexRenderData {
-        VertexRenderData {
-            pix: Point2::new(pix.x, pix.y),
-            z_view: view_pos.z,
-            texcoord: if matches!(texture_source, TextureSource::Image(_)) {
-                Some(vertex.texcoord)
-            } else {
-                None
-            },
-            normal_view: Some(all_view_normals[global_index]),
-            position_view: Some(view_pos),
-        }
-    }
-
     /// 获取ModelData中的总顶点数
     fn estimate_vertex_count(model_data: &ModelData) -> usize {
         model_data
@@ -660,13 +844,20 @@ impl Renderer {
             .sum()
     }
 
+    /// 执行几何变换，现在也返回世界空间坐标
     fn transform_geometry(
         &self,
         model_data: &ModelData,
         scene_object: &SceneObject,
         camera: &Camera,
         settings: &RenderSettings,
-    ) -> GeometryTransformResult {
+    ) -> (
+        Vec<Point2<f32>>,  // 屏幕坐标
+        Vec<Point3<f32>>,  // 视图空间坐标
+        Vec<Vector3<f32>>, // 视图空间法线
+        Vec<Point3<f32>>,  // 世界空间坐标 (新增)
+        Vec<usize>,        // 网格顶点偏移量
+    ) {
         // 获取对象的模型矩阵
         let model_matrix = scene_object.transform;
 
@@ -692,7 +883,13 @@ impl Renderer {
         };
         let projection_matrix = camera.get_projection_matrix(projection_type);
 
-        // 直接调用 transform.rs 中的变换函数
+        // 计算世界空间坐标 (用于阴影计算)
+        let all_world_coords: Vec<Point3<f32>> = all_vertices_model
+            .iter()
+            .map(|vertex| model_matrix.transform_point(vertex))
+            .collect();
+
+        // 调用 transform.rs 中的变换函数获取屏幕和视图空间坐标
         let (all_pixel_coords, all_view_coords, all_view_normals) = transform_pipeline_batch(
             &all_vertices_model,
             &all_normals_model,
@@ -707,15 +904,8 @@ impl Renderer {
             all_pixel_coords,
             all_view_coords,
             all_view_normals,
+            all_world_coords, // 返回世界空间坐标
             mesh_vertex_offsets,
         )
     }
 }
-
-/// 优化的几何变换结果类型
-pub type GeometryTransformResult = (
-    Vec<Point2<f32>>,  // 屏幕坐标
-    Vec<Point3<f32>>,  // 视图空间坐标
-    Vec<Vector3<f32>>, // 视图空间法线
-    Vec<usize>,        // 网格顶点偏移量
-);
