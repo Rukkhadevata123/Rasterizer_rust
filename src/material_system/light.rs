@@ -1,22 +1,11 @@
 use crate::io::render_settings::parse_vec3;
-use clap::ValueEnum;
 use nalgebra::{Point3, Vector3};
 
-/// 光照预设模式
-#[derive(Debug, Clone, Default, PartialEq, Eq, ValueEnum)]
-pub enum LightingPreset {
-    #[default]
-    SingleDirectional,
-    ThreeDirectional,
-    MixedComplete,
-    None,
-}
-
-/// 🔥 **统一的光源结构** - 简化版本
+/// 🔥 **统一的光源结构** - 完全移除预设系统
 #[derive(Debug, Clone)]
 pub enum Light {
     Directional {
-        // 配置字段 (用于GUI控制)
+        // 配置字段 (用于GUI控制和TOML序列化)
         enabled: bool,
         direction_str: String, // "x,y,z" 格式，用于GUI编辑
         color_str: String,     // "r,g,b" 格式，用于GUI编辑
@@ -27,7 +16,7 @@ pub enum Light {
         color: Vector3<f32>,     // 解析后的颜色向量
     },
     Point {
-        // 配置字段 (用于GUI控制)
+        // 配置字段 (用于GUI控制和TOML序列化)
         enabled: bool,
         position_str: String, // "x,y,z" 格式，用于GUI编辑
         color_str: String,    // "r,g,b" 格式，用于GUI编辑
@@ -78,6 +67,25 @@ impl Light {
             position,
             color,
         }
+    }
+
+    /// 🔥 **创建默认方向光** - 用于初始化
+    pub fn default_directional() -> Self {
+        Self::directional(
+            Vector3::new(0.0, -1.0, -1.0),
+            Vector3::new(1.0, 1.0, 1.0),
+            0.8,
+        )
+    }
+
+    /// 🔥 **创建默认点光源** - 用于初始化
+    pub fn default_point() -> Self {
+        Self::point(
+            Point3::new(0.0, 2.0, 0.0),
+            Vector3::new(1.0, 1.0, 1.0),
+            1.0,
+            Some((1.0, 0.09, 0.032)),
+        )
     }
 
     /// 🔥 **更新运行时字段** - 从字符串配置重新解析
@@ -153,87 +161,20 @@ impl Light {
             }
         }
     }
-}
 
-/// 🔥 **简化的光源管理器**
-pub struct LightManager;
-
-impl LightManager {
-    /// 🔥 **创建预设光源** - 返回统一的Light数组
-    pub fn create_preset_lights(
-        preset: &LightingPreset,
-        use_lighting: bool,
-        main_intensity: f32,
-    ) -> Vec<Light> {
-        // 如果不使用光照，直接返回空数组
-        if !use_lighting {
-            return Vec::new();
+    /// 🔥 **获取光源类型字符串** - 用于GUI显示
+    pub fn get_type_name(&self) -> &'static str {
+        match self {
+            Self::Directional { .. } => "方向光",
+            Self::Point { .. } => "点光源",
         }
+    }
 
-        let lights = match preset {
-            LightingPreset::SingleDirectional => {
-                vec![Light::directional(
-                    Vector3::new(0.0, -1.0, -1.0),
-                    Vector3::new(1.0, 1.0, 1.0),
-                    main_intensity,
-                )]
-            }
-            LightingPreset::ThreeDirectional => {
-                vec![
-                    Light::directional(
-                        Vector3::new(0.0, -1.0, -1.0),
-                        Vector3::new(1.0, 1.0, 1.0),
-                        main_intensity * 0.7,
-                    ),
-                    Light::directional(
-                        Vector3::new(-1.0, -0.5, 0.2),
-                        Vector3::new(0.9, 0.9, 1.0),
-                        main_intensity * 0.5,
-                    ),
-                    Light::directional(
-                        Vector3::new(1.0, -0.5, 0.2),
-                        Vector3::new(1.0, 0.9, 0.8),
-                        main_intensity * 0.3,
-                    ),
-                ]
-            }
-            LightingPreset::MixedComplete => {
-                let mut lights = vec![Light::directional(
-                    Vector3::new(0.0, -1.0, -1.0),
-                    Vector3::new(1.0, 1.0, 1.0),
-                    main_intensity * 0.6,
-                )];
-
-                let point_configs = [
-                    (Point3::new(2.0, 3.0, 2.0), Vector3::new(1.0, 0.8, 0.6)),
-                    (Point3::new(-2.0, 3.0, 2.0), Vector3::new(0.6, 0.8, 1.0)),
-                    (Point3::new(2.0, 3.0, -2.0), Vector3::new(0.8, 1.0, 0.8)),
-                    (Point3::new(-2.0, 3.0, -2.0), Vector3::new(1.0, 0.8, 1.0)),
-                ];
-
-                for (pos, color) in &point_configs {
-                    lights.push(Light::point(
-                        *pos,
-                        *color,
-                        main_intensity * 0.5,
-                        Some((1.0, 0.09, 0.032)),
-                    ));
-                }
-
-                lights
-            }
-            LightingPreset::None => Vec::new(),
-        };
-
-        // 🔥 **融合 ensure 逻辑：如果预设为空但启用了光照，创建默认光源**
-        if lights.is_empty() && use_lighting {
-            vec![Light::directional(
-                Vector3::new(0.0, -1.0, -1.0),
-                Vector3::new(1.0, 1.0, 1.0),
-                main_intensity * 0.8,
-            )]
-        } else {
-            lights
+    /// 🔥 **获取光源图标** - 用于GUI显示
+    pub fn get_icon(&self) -> &'static str {
+        match self {
+            Self::Directional { .. } => "🔦",
+            Self::Point { .. } => "💡",
         }
     }
 }

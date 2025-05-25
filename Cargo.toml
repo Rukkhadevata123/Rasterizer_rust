@@ -15,6 +15,8 @@ egui = "0.31"
 eframe = "0.31"
 native-dialog = "0.9.0"
 chrono = "0.4"
+serde = "1.0"
+toml = "0.8"
 
 [[bin]]
 name = "rasterizer"

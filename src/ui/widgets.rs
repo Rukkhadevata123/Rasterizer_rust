@@ -52,6 +52,9 @@ pub trait WidgetMethods {
 
     /// 绘制渲染信息面板
     fn ui_render_info_panel(app: &mut RasterizerApp, ui: &mut egui::Ui);
+
+    /// 🔥 **新增：绘制配置文件管理面板**
+    fn ui_config_file_panel(app: &mut RasterizerApp, ui: &mut egui::Ui, ctx: &Context);
 }
 
 impl WidgetMethods for RasterizerApp {
@@ -92,6 +95,10 @@ impl WidgetMethods for RasterizerApp {
     /// 🔥 **重构后的侧边栏 - 调用各个面板函数**
     fn draw_side_panel(&mut self, ctx: &Context, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.collapsing("配置文件管理", |ui| {
+                Self::ui_config_file_panel(self, ui, ctx);
+            });
+
             // 文件与输出设置
             ui.collapsing("文件与输出设置", |ui| {
                 Self::ui_file_output_panel(self, ui, ctx);
@@ -147,6 +154,220 @@ impl WidgetMethods for RasterizerApp {
             // 渲染信息
             Self::ui_render_info_panel(self, ui);
         });
+    }
+
+    fn ui_config_file_panel(app: &mut RasterizerApp, ui: &mut egui::Ui, ctx: &Context) {
+        // 配置文件状态显示
+        ui.group(|ui| {
+            ui.label(RichText::new("📋 当前配置").size(14.0).strong());
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                ui.label("配置文件:");
+                if let Some(config_path) = &app.current_config_path {
+                    let filename = std::path::Path::new(config_path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("未知");
+                    ui.label(RichText::new(filename).color(Color32::from_rgb(100, 200, 100)));
+                } else {
+                    ui.label(RichText::new("默认设置").color(Color32::GRAY));
+                }
+            });
+
+            // 验证当前配置
+            ui.horizontal(|ui| {
+                let validate_button = ui.button("🔍 验证配置");
+                if validate_button.clicked() {
+                    match app.settings.validate() {
+                        Ok(_) => {
+                            app.config_status_message = "✅ 配置验证通过".to_string();
+                        }
+                        Err(e) => {
+                            app.config_status_message = format!("❌ 配置验证失败: {}", e);
+                        }
+                    }
+                }
+                Self::add_tooltip(validate_button, ctx, "检查当前配置是否有效，包括文件路径等");
+            });
+        });
+
+        ui.add_space(10.0);
+
+        // 文件操作按钮
+        ui.group(|ui| {
+            ui.label(RichText::new("📁 文件操作").size(14.0).strong());
+            ui.separator();
+
+            // 第一行：新建、打开
+            ui.horizontal(|ui| {
+                let new_button = ui.button("🆕 新建配置");
+                if new_button.clicked() {
+                    app.new_config_file();
+                }
+                Self::add_tooltip(new_button, ctx, "创建新的空白配置文件");
+
+                let open_button = ui.button("📂 打开配置");
+                if open_button.clicked() {
+                    app.open_config_file();
+                }
+                Self::add_tooltip(open_button, ctx, "从文件加载配置");
+            });
+
+            // 第二行：保存、另存为
+            ui.horizontal(|ui| {
+                let save_enabled = app.current_config_path.is_some();
+                let save_button = ui.add_enabled(save_enabled, egui::Button::new("💾 保存"));
+                if save_button.clicked() {
+                    app.save_current_config();
+                }
+                Self::add_tooltip(save_button, ctx, "保存当前设置到配置文件");
+
+                let save_as_button = ui.button("📝 另存为");
+                if save_as_button.clicked() {
+                    app.save_config_as();
+                }
+                Self::add_tooltip(save_as_button, ctx, "将当前设置保存为新的配置文件");
+            });
+
+            // 第三行：重新加载
+            ui.horizontal(|ui| {
+                let reload_enabled = app.current_config_path.is_some();
+                let reload_button =
+                    ui.add_enabled(reload_enabled, egui::Button::new("🔄 重新加载"));
+                if reload_button.clicked() {
+                    app.reload_current_config();
+                }
+                Self::add_tooltip(reload_button, ctx, "重新加载当前配置文件，丢弃未保存的更改");
+            });
+        });
+
+        ui.add_space(10.0);
+
+        // 最近使用的配置文件
+        ui.group(|ui| {
+            ui.label(RichText::new("🕐 最近使用").size(14.0).strong());
+            ui.separator();
+
+            if app.recent_config_files.is_empty() {
+                ui.label(RichText::new("暂无最近使用的配置文件").color(Color32::GRAY));
+            } else {
+                // 显示最近5个配置文件
+                for (index, config_path) in app.recent_config_files.iter().enumerate() {
+                    if index >= 5 {
+                        break;
+                    }
+
+                    let filename = std::path::Path::new(config_path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("未知文件");
+
+                    ui.horizontal(|ui| {
+                        // 文件按钮
+                        let file_button = ui.button(format!("📄 {}", filename));
+                        if file_button.clicked() {
+                            app.load_recent_config(config_path.clone());
+                        }
+
+                        // 从列表中移除按钮
+                        if ui.small_button("❌").clicked() {
+                            app.remove_from_recent_configs(config_path.clone());
+                        }
+                    });
+
+                    // 显示完整路径作为工具提示
+                    if ui.small(config_path).hovered() {
+                        egui::show_tooltip_at_pointer(
+                            ctx,
+                            egui::Id::new("config_path_tooltip"),
+                            |ui| {
+                                ui.label(config_path);
+                            },
+                        );
+                    }
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.small_button("清空历史").clicked() {
+                        app.clear_recent_configs();
+                    }
+                    ui.label(
+                        RichText::new(format!("({} 个文件)", app.recent_config_files.len()))
+                            .color(Color32::GRAY),
+                    );
+                });
+            }
+        });
+
+        ui.add_space(10.0);
+
+        // 预设配置模板
+        ui.group(|ui| {
+            ui.label(RichText::new("🎨 预设模板").size(14.0).strong());
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                if ui.button("📐 基础渲染").clicked() {
+                    app.load_preset_config("basic");
+                }
+                if ui.button("💡 高质量光照").clicked() {
+                    app.load_preset_config("high_quality");
+                }
+            });
+
+            ui.horizontal(|ui| {
+                if ui.button("🎬 动画优化").clicked() {
+                    app.load_preset_config("animation");
+                }
+                if ui.button("🔬 材质展示").clicked() {
+                    app.load_preset_config("material_showcase");
+                }
+            });
+
+            ui.small("💡 选择预设将覆盖当前设置");
+        });
+
+        ui.add_space(10.0);
+
+        // 配置信息显示
+        ui.group(|ui| {
+            ui.label(RichText::new("ℹ️ 配置信息").size(14.0).strong());
+            ui.separator();
+
+            // 显示配置摘要按钮
+            if ui
+                .button(if app.show_config_summary {
+                    "📊 隐藏配置摘要"
+                } else {
+                    "📊 显示配置摘要"
+                })
+                .clicked()
+            {
+                app.show_config_summary = !app.show_config_summary;
+            }
+
+            if app.show_config_summary {
+                ui.separator();
+                app.display_config_summary(ui);
+            }
+        });
+
+        // 显示状态消息
+        if !app.config_status_message.is_empty() {
+            ui.add_space(5.0);
+            ui.separator();
+            ui.label(
+                RichText::new(&app.config_status_message)
+                    .color(if app.config_status_message.starts_with("❌") {
+                        Color32::from_rgb(255, 100, 100)
+                    } else {
+                        Color32::from_rgb(100, 255, 100)
+                    })
+                    .size(12.0),
+            );
+        }
     }
 
     /// 🔥 **文件与输出设置面板**
@@ -948,7 +1169,7 @@ impl WidgetMethods for RasterizerApp {
         });
     }
 
-    /// 🔥 **光照设置面板** - 移除主光源强度控制
+    /// 🔥 **简化的光照设置面板** - 完全移除预设系统
     fn ui_lighting_panel(app: &mut RasterizerApp, ui: &mut egui::Ui, _ctx: &Context) {
         // 总光照开关
         let resp = ui
@@ -989,82 +1210,20 @@ impl WidgetMethods for RasterizerApp {
 
         ui.separator();
 
-        // 🔥 **光照预设选择器** - 简化，移除主光源强度参数
-        ui.horizontal(|ui| {
-            ui.label("光照预设:");
-            let old_preset = app.settings.lighting_preset.clone();
-
-            egui::ComboBox::from_id_salt("lighting_preset_combo")
-                .selected_text(match app.settings.lighting_preset {
-                    crate::material_system::light::LightingPreset::SingleDirectional => {
-                        "单一方向光"
-                    }
-                    crate::material_system::light::LightingPreset::ThreeDirectional => "三面方向光",
-                    crate::material_system::light::LightingPreset::MixedComplete => "混合光源",
-                    crate::material_system::light::LightingPreset::None => "无光源",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut app.settings.lighting_preset,
-                        crate::material_system::light::LightingPreset::SingleDirectional,
-                        "单一方向光",
-                    );
-                    ui.selectable_value(
-                        &mut app.settings.lighting_preset,
-                        crate::material_system::light::LightingPreset::ThreeDirectional,
-                        "三面方向光",
-                    );
-                    ui.selectable_value(
-                        &mut app.settings.lighting_preset,
-                        crate::material_system::light::LightingPreset::MixedComplete,
-                        "混合光源",
-                    );
-                    ui.selectable_value(
-                        &mut app.settings.lighting_preset,
-                        crate::material_system::light::LightingPreset::None,
-                        "无光源",
-                    );
-                });
-
-            // 🔥 **自动应用：预设变化时立即更新光源** - 使用默认强度
-            if app.settings.lighting_preset != old_preset {
-                app.settings.lights =
-                    crate::material_system::light::LightManager::create_preset_lights(
-                        &app.settings.lighting_preset,
-                        app.settings.use_lighting,
-                        app.settings.main_light_intensity, // 保持CLI兼容性，但GUI不显示
-                    );
-                app.interface_interaction.anything_changed = true;
-            }
-        });
-
-        // 🔥 **移除了主光源强度控制** - GUI中直接编辑各个光源
-
-        ui.separator();
-
-        // 🔥 **动态光源管理** - 添加/删除按钮
+        // 🔥 **移除预设选择器 - 直接光源管理**
         if app.settings.use_lighting {
             ui.horizontal(|ui| {
                 if ui.button("➕ 添加方向光").clicked() {
                     app.settings
                         .lights
-                        .push(crate::material_system::light::Light::directional(
-                            nalgebra::Vector3::new(0.0, -1.0, -1.0),
-                            nalgebra::Vector3::new(1.0, 1.0, 1.0),
-                            0.8, // 🔥 **直接使用合理的默认强度**
-                        ));
+                        .push(crate::material_system::light::Light::default_directional());
                     app.interface_interaction.anything_changed = true;
                 }
 
                 if ui.button("➕ 添加点光源").clicked() {
                     app.settings
                         .lights
-                        .push(crate::material_system::light::Light::point(
-                            nalgebra::Point3::new(0.0, 2.0, 0.0),
-                            nalgebra::Vector3::new(1.0, 1.0, 1.0),
-                            1.0, // 🔥 **直接使用合理的默认强度**
-                            Some((1.0, 0.09, 0.032)),
-                        ));
+                        .push(crate::material_system::light::Light::default_point());
                     app.interface_interaction.anything_changed = true;
                 }
 
@@ -1074,7 +1233,7 @@ impl WidgetMethods for RasterizerApp {
 
             ui.separator();
 
-            // 🔥 **可编辑的光源列表** - 每个光源都有独立的强度控制
+            // 🔥 **可编辑的光源列表** - 使用新的Light方法
             let mut to_remove = Vec::new();
             for (i, light) in app.settings.lights.iter_mut().enumerate() {
                 let mut light_changed = false;
@@ -1087,15 +1246,13 @@ impl WidgetMethods for RasterizerApp {
                             app.interface_interaction.anything_changed = true;
                         }
 
-                        // 光源类型和编号
-                        match light {
-                            crate::material_system::light::Light::Directional { .. } => {
-                                ui.label(format!("🔦 方向光 #{}", i + 1));
-                            }
-                            crate::material_system::light::Light::Point { .. } => {
-                                ui.label(format!("💡 点光源 #{}", i + 1));
-                            }
-                        }
+                        // 🔥 **使用新的方法获取图标和类型**
+                        ui.label(format!(
+                            "{} {} #{}",
+                            light.get_icon(),
+                            light.get_type_name(),
+                            i + 1
+                        ));
                     });
 
                     // 🔥 **光源参数编辑** - 每个光源独立控制强度
@@ -1268,7 +1425,6 @@ impl WidgetMethods for RasterizerApp {
                 ui.group(|ui| {
                     ui.label("💡 提示：当前没有光源");
                     ui.label("点击上方的「➕ 添加」按钮来添加光源");
-                    ui.label("🎛️ 或选择光照预设快速配置");
                 });
             }
         }

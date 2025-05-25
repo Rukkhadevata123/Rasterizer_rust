@@ -16,7 +16,9 @@ dependencies = [
  "native-dialog",
  "rand 0.9.1",
  "rayon",
+ "serde",
  "tobj",
+ "toml",
 ]
 
 [[package]]
@@ -3696,8 +3698,15 @@ dependencies = [
  "serde",
  "serde_spanned",
  "toml_datetime",
+ "toml_write",
  "winnow",
 ]
+
+[[package]]
+name = "toml_write"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bfb942dfe1d8e29a7ee7fcbde5bd2b9a25fb89aa70caea2eba3bee836ff41076"
 
 [[package]]
 name = "tracing"

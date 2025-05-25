@@ -20,6 +20,12 @@ pub trait RenderUIMethods {
 
     /// 选择输出目录
     fn select_output_dir(&mut self);
+
+    /// 选择配置文件
+    fn select_config_file(&mut self);
+
+    /// 保存配置文件
+    fn save_config_file(&mut self);
 }
 
 impl RenderUIMethods for RasterizerApp {
@@ -142,6 +148,62 @@ impl RenderUIMethods for RasterizerApp {
             }
             Err(e) => {
                 self.set_error(format!("目录选择器错误: {}", e));
+            }
+        }
+    }
+
+        fn select_config_file(&mut self) {
+        let result = FileDialogBuilder::default()
+            .set_title("选择配置文件")
+            .add_filter("TOML配置文件", ["toml"])
+            .add_filter("所有文件", ["*"])
+            .open_single_file()
+            .show();
+
+        match result {
+            Ok(Some(path)) => {
+                if let Some(path_str) = path.to_str() {
+                    self.load_config_from_path(path_str.to_string());
+                }
+            }
+            Ok(None) => {
+                self.config_status_message = "配置文件选择被取消".to_string();
+            }
+            Err(e) => {
+                self.config_status_message = format!("配置文件选择错误: {}", e);
+            }
+        }
+    }
+
+    /// 🔥 **新增：保存配置文件**
+    fn save_config_file(&mut self) {
+        let result = FileDialogBuilder::default()
+            .set_title("保存配置文件")
+            .add_filter("TOML配置文件", ["toml"])
+            .set_file_name("config.toml")
+            .save_file()
+            .show();
+
+        match result {
+            Ok(Some(path)) => {
+                if let Some(path_str) = path.to_str() {
+                    match self.save_to_toml_file(path_str) {
+                        Ok(_) => {
+                            self.current_config_path = Some(path_str.to_string());
+                            self.add_to_recent_configs(path_str.to_string());
+                            self.config_status_message = format!("配置已保存到 {}", path_str);
+                        }
+                        Err(e) => {
+                            self.config_status_message = format!("保存失败: {}", e);
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                self.config_status_message = "保存被取消".to_string();
+            }
+            Err(e) => {
+                self.config_status_message = format!("保存文件对话框错误: {}", e);
             }
         }
     }
